@@ -1,0 +1,67 @@
+# 不同地图的配置参数
+# 使用方法：在启动文件中根据地图名称选择相应的参数
+
+# 沙漠地图配置
+desert:
+  map_boundaries:
+    x_min: -5.0
+    x_max: 5.0
+    y_min: -5.0
+    y_max: 5.0
+    min_distance: 2.0
+  generation_params:
+    path_num: 1000
+    sample_density: 0.1
+    publish_delay: 2.0
+
+# 森林地图配置
+forest:
+  map_boundaries:
+    x_min: -5.0
+    x_max: 5.0
+    y_min: -5.0
+    y_max: 5.0
+    min_distance: 2.0
+  generation_params:
+    path_num: 1000
+    sample_density: 0.1
+    publish_delay: 2.0
+
+# 山地地图配置
+mountain:
+  map_boundaries:
+    x_min: -5.0
+    x_max: 5.0
+    y_min: -5.0
+    y_max: 5.0
+    min_distance: 2.0
+  generation_params:
+    path_num: 800
+    sample_density: 0.08
+    publish_delay: 2.5
+
+# 丘陵地图配置
+hill:
+  map_boundaries:
+    x_min: -5.0
+    x_max: 5.0
+    y_min: -5.0
+    y_max: 5.0
+    min_distance: 2.0
+  generation_params:
+    path_num: 1200
+    sample_density: 0.12
+    publish_delay: 2.0
+
+# 火山地图配置
+volcano:
+  map_boundaries:
+    x_min: -5.0
+    x_max: 5.0
+    y_min: -5.0
+    y_max: 5.0
+    min_distance: 2.0
+  generation_params:
+    path_num: 600
+    sample_density: 0.08
+    publish_delay: 3.0

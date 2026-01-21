@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 小规模测试配置 - 用于验证系统工作正常 -->
+    
+    <!-- 测试参数 -->
+    <arg name="num_environments" default="3" doc="测试环境数量"/>
+    <arg name="train_paths_per_env" default="5" doc="每个环境的训练路径数量"/>
+    <arg name="val_paths_per_env" default="2" doc="每个环境的验证路径数量"/>
+    <arg name="dataset_dir" default="$(find plan_manager)/datasets/test_terrain_dataset" doc="测试数据集输出目录"/>
+    
+    <!-- 启用可视化用于调试 -->
+    <arg name="enable_rviz" default="true"/>
+    
+    <!-- 地图文件参数 -->
+    <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd" doc="PCD地图文件路径"/>
+    <arg name="map_file" default="" doc="预计算地图文件路径（为空时自动生成）"/>
+    
+    <!-- 包含主要的launch文件，但使用测试参数 -->
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation.launch">
+        <arg name="num_environments" value="$(arg num_environments)"/>
+        <arg name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
+        <arg name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
+        <arg name="dataset_dir" value="$(arg dataset_dir)"/>
+        <arg name="start_env_id" value="0"/>
+        <arg name="map_pcd" value="$(arg map_pcd)"/>
+        <arg name="map_file" value="$(arg map_file)"/>
+        
+        <!-- 使用较快的生成参数 -->
+        <arg name="publish_delay" value="0.05"/>
+        <arg name="min_distance" value="1.5"/>
+        
+        <!-- 启用RViz -->
+        <arg name="enable_rviz" value="$(arg enable_rviz)"/>
+    </include>
+    
+    <!-- 打印测试信息 -->
+    <node name="test_info" pkg="rostopic" type="rostopic" args="echo /test_info -n 1" output="screen"/>
+</launch>

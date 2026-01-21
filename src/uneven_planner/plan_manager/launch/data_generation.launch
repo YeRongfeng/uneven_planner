@@ -1,0 +1,101 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 参数 -->
+    <arg name="map_name" default="desert" />
+    <arg name="start_index" default="0" />
+    <arg name="path_num" default="100" />
+    <arg name="export_dir" default="$(find plan_manager)/data" />
+    <arg name="sample_density" default="0.1" />
+    <arg name="publish_delay" default="0.05" />  <!-- 极快重试：50ms -->
+
+    <!-- 地图边界参数（与实际地图大小一致：-5.0到5.0） -->
+    <arg name="map_x_min" default="-5.0" />
+    <arg name="map_x_max" default="5.0" />
+    <arg name="map_y_min" default="-5.0" />
+    <arg name="map_y_max" default="5.0" />
+    <arg name="min_distance" default="2.0" />
+
+    <!-- 地图文件路径 -->
+    <arg name="map_file" default="$(find uneven_map)/maps/$(arg map_name).map" />
+    <arg name="pcd_file" default="$(find uneven_map)/maps/$(arg map_name).pcd" />
+
+    <!-- 参数文件 - 使用数据生成专用参数 -->
+    <rosparam file="$(find plan_manager)/params/data_generation.yaml" command="load" />
+
+    <!-- 全局地图参数（确保在正确的命名空间） -->
+    <param name="uneven_map/map_pcd" type="string" value="$(find uneven_map)/maps/$(arg map_name).pcd" />
+    <param name="uneven_map/map_file" type="string" value="$(find uneven_map)/maps/$(arg map_name).map" />
+
+    <!-- 关键地图参数（直接设置，确保能被找到） -->
+    <param name="uneven_map/map_size_x" type="double" value="10.0" />
+    <param name="uneven_map/map_size_y" type="double" value="10.0" />
+    <param name="uneven_map/xy_resolution" type="double" value="0.05" />
+    <param name="uneven_map/yaw_resolution" type="double" value="0.314" />
+    <param name="uneven_map/ellipsoid_x" type="double" value="0.2" />
+    <param name="uneven_map/ellipsoid_y" type="double" value="0.1" />
+    <param name="uneven_map/ellipsoid_z" type="double" value="0.1" />
+    <param name="uneven_map/min_cnormal" type="double" value="0.8" />
+    <param name="uneven_map/max_rho" type="double" value="0.001" />
+    <param name="uneven_map/gravity" type="double" value="9.81" />
+    <param name="uneven_map/mass" type="double" value="1.0" />
+
+    <!-- 轨迹优化和重采样参数 -->
+    <param name="manager/enable_optimization" type="bool" value="true" />
+    <param name="manager/resample_points" type="int" value="100" />
+
+    <!-- 固定位姿参数（全局参数） -->
+    <param name="manager/start_fixed" type="yaml" value="[-999.0, -999.0, 1.57]" />
+    <param name="manager/end_fixed" type="yaml" value="[-999.0, -999.0, 0.0]" />
+
+    <!-- 可视化参数 -->
+    <arg name="enable_visualization" default="true" />
+    <arg name="save_plots" default="true" />
+    <arg name="plot_dir" default="$(find plan_manager)/data/plots" />
+
+    <!-- 路径规划节点 -->
+    <node pkg="plan_manager" type="only_planner_node" name="only_planner_node" output="screen">
+        <!-- 加载原始参数文件 -->
+        <rosparam file="$(find plan_manager)/params/data_generation.yaml" command="load" />
+
+        <remap from="start_pose" to="/data_generate_node/start_pose" />
+        <remap from="target_pose" to="/data_generate_node/target_pose" />
+        <remap from="optimized_traj" to="/data_generate_node/optimized_traj" />
+        <remap from="planning_result" to="/data_generate_node/planning_result" />
+    </node>
+
+    <!-- 数据生成节点 (Python) -->
+    <node pkg="plan_manager" type="data_generate.py" name="data_generate_node" output="screen">
+        <param name="start_index" value="$(arg start_index)" />
+        <param name="path_num" value="$(arg path_num)" />
+        <param name="export_dir" value="$(arg export_dir)" />
+        <param name="map_name" value="$(arg map_name)" />
+        <param name="sample_density" value="$(arg sample_density)" />
+        <param name="publish_delay" value="$(arg publish_delay)" />
+
+        <!-- 地图边界参数 -->
+        <param name="map_x_min" value="$(arg map_x_min)" />
+        <param name="map_x_max" value="$(arg map_x_max)" />
+        <param name="map_y_min" value="$(arg map_y_min)" />
+        <param name="map_y_max" value="$(arg map_y_max)" />
+        <param name="min_distance" value="$(arg min_distance)" />
+
+        <!-- 可选的地图转换参数 -->
+        <param name="enable_map_transform" value="true" />
+        <param name="enable_map_visualization" value="true" />
+        <param name="coarse_resolution" value="0.2" />
+        <param name="fine_resolution" value="0.1" /> <!-- 栅格化分辨率 100x100 -->
+        <param name="voxel_size" value="0.1" /> <!-- 栅格化分辨率 -->
+    </node>
+
+    <!-- 轨迹可视化节点 (Python) -->
+    <node pkg="plan_manager" type="trajectory_visualizer.py" name="trajectory_visualizer"
+          output="screen" if="$(arg enable_visualization)">
+        <param name="enable_visualization" value="$(arg enable_visualization)" />
+        <param name="save_plots" value="$(arg save_plots)" />
+        <param name="plot_dir" value="$(arg plot_dir)" />
+    </node>
+
+    <!-- RViz可视化 (可选) -->
+    <!-- <node pkg="rviz" type="rviz" name="rviz" args="-d $(find plan_manager)/rviz/default.rviz" /> -->
+
+</launch>

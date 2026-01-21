@@ -1,0 +1,89 @@
+uneven_map:
+  iter_num: 2
+  map_size_x: 40.0
+  map_size_y: 40.0
+  ellipsoid_x: 0.2
+  ellipsoid_y: 0.1
+  ellipsoid_z: 0.1
+  xy_resolution: 0.4
+  yaw_resolution: 0.1
+  min_cnormal: 0.8               # 最小法向量 (无量纲)
+  max_rho: 0.001
+  gravity: 9.81
+  mass: 1.0
+  map_pcd: ""  # 将通过launch参数设置
+  map_file: ""  # 将通过launch参数设置
+
+kino_astar:
+  yaw_resolution: 3.15        # 角度分辨率 (弧度)
+  lambda_heu: 1.0             # 启发式函数的权重
+  weight_r2: 1.0              # R^2项的权重
+  weight_so2: 0.5             # SO(2)项的权重
+  weight_v_change: 0.0        # 速度变化项的权重
+  weight_delta_change: 0.0    # 方向变化项的权重
+  weight_sigma: 10.0          # 侧向位移项的权重
+  time_interval: 1.2          # 时间间隔 (s)
+  collision_interval: 0.06    # 碰撞检测间隔 (s)
+  oneshot_range: 4.0          # 一次性规划范围 (m) - 适配40m地图的较大规划距离
+  wheel_base: 0.26            # 车辆轴距 (m)
+  max_steer: 0.4              # 最大转向角 (弧度)
+  max_vel: 0.5                # 最大速度 (m/s)
+  in_test: false              # 是否在测试模式下运行
+
+alm_traj_opt:
+  rho_T: 100000.0             # 轨迹优化的时间权重
+  rho_ter: 10.0               # 轨迹优化的地形权重
+  max_vel: 0.5                # 最大速度 (m/s)
+  max_acc_lon: 5.0            # 最大纵向加速度 (m/s^2)
+  max_acc_lat: 10.0           # 最大横向加速度 (m/s^2)
+  max_kap: 1.6                # 最大曲率 (1/m)
+  min_cxi: 0.8                # 最小法向量 (无量纲)
+  max_sig: 0.05               # 最大侧向位移 (m)
+  use_scaling: true           # 是否使用缩放因子
+  rho: 1.0                    # 轨迹优化的缩放因子
+  beta: 1000.0                # 轨迹优化的beta参数
+  gamma: 1.0                  # 轨迹优化的gamma参数
+  epsilon_con: 0.001          # 轨迹优化的约束松弛参数
+  max_iter: 10                # 轨迹优化的最大迭代次数
+  g_epsilon: 1.0e-03          # 轨迹优化的梯度容忍度
+  min_step: 1.0e-32           # 轨迹优化的最小步长
+  inner_max_iter: 100000      # 轨迹优化的内层最大迭代次数
+  delta: 1.0e-4               # 轨迹优化的delta参数
+  mem_size: 256               # 轨迹优化的内存大小
+  past: 3                     # 轨迹优化的过去时间窗口
+  int_K: 16                   # 轨迹优化的积分时间窗口
+  in_test: false              # 是否在测试模式下运行
+  in_debug: false             # 是否在调试模式下运行
+
+manager:
+  piece_len: 0.3              # 轨迹片段长度 (m)
+  mean_vel: 0.5               # 平均速度 (m/s)
+  init_time_times: 1.2        # 初始化时间倍数 (无量纲)
+  yaw_piece_times: 2.0        # 偏航角片段时间倍数 (无量纲)
+  init_sig_vel: 0.05          # 初始化侧向速度 (m/s)
+  enable_optimization: true   # 是否启用优化
+  resample_points: 22         # 重新采样点数 (无量纲)
+  # min_planning_distance: 4.5  # 最小规划距离 (m)
+  # max_planning_distance: 6.0  # 最大规划距离 (m)
+  min_planning_distance: 20.0  # 最小规划距离 (m)
+  max_planning_distance: 100.0  # 最大规划距离 (m)
+  start_fixed: [-999.0, -999.0, -999.0]  # 固定起点 (m, m, rad)
+  end_fixed: [-999.0, -999.0, -999.0]    # 固定终点 (m, m, rad)
+
+# 数据集生成相关参数
+terrain_dataset_generator:
+  map_size: 40.0              # 地图尺寸 (m)
+  map_resolution: 0.02        # 地图分辨率 (m)
+  voxel_size: 0.2             # 体素大小 (m)
+  coarse_resolution: 0.8      # 粗分辨率 (m)
+  fine_resolution: 0.4        # 精细分辨率 (m)
+  min_distance: 1.5           # 最小距离 (m)
+  publish_delay: 0.05         # 发布延迟 (s)
+  min_height: -3.0            # 最小高度 (m)
+  max_height: 3.0             # 最大高度 (m)
+  num_environments: 3         # 环境数量
+  train_paths_per_env: 5      # 每个环境的训练路径数量
+  val_paths_per_env: 2        # 每个环境的验证路径数量
+  start_env_id: 1             # 起始环境ID
+  dataset_dir: /home/yrf/uneven_planner/src/uneven_planner/plan_manager/datasets/test_terrain_dataset
+  map_update_timeout: 10.0    # 地图更新超时 (s)

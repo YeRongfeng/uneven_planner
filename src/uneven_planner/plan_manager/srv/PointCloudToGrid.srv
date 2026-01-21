@@ -1,0 +1,19 @@
+# Request
+sensor_msgs/PointCloud2 pointcloud
+float32 map_min_x
+float32 map_min_y
+float32 map_max_x
+float32 map_max_y
+
+---
+
+# Response
+bool success
+string message
+float32 resolution
+int32 grid_width
+int32 grid_height
+float32[] elevation_grid
+float32[] normal_x_grid
+float32[] normal_y_grid
+float32[] normal_z_grid

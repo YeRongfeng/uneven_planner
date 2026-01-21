@@ -1,0 +1,78 @@
+only_planner_node:
+  uneven_map:
+    iter_num: 2
+    map_size_x: 10.0
+    map_size_y: 10.0
+    ellipsoid_x: 0.2
+    ellipsoid_y: 0.1
+    ellipsoid_z: 0.1
+    xy_resolution: 0.05
+    yaw_resolution: 0.1
+    min_cnormal: 0.8
+    max_rho: 0.001
+    gravity: 9.81
+    mass: 1.0
+    # 地图文件路径将在launch文件中设置
+
+  kino_astar:
+    yaw_resolution: 3.15        # 角度分辨率 (弧度)
+    lambda_heu: 1.0             # 启发式函数的权重
+    weight_r2: 1.0              # R^2项的权重
+    weight_so2: 0.5             # SO(2)项的权重
+    weight_v_change: 0.0        # 速度变化项的权重
+    weight_delta_change: 0.0    # 方向变化项的权重
+    weight_sigma: 10.0          # 侧向位移项的权重
+    time_interval: 0.3          # 时间间隔 (s)
+    collision_interval: 0.06    # 碰撞检测间隔 (s)
+    oneshot_range: 1.0          # 一次性规划范围 (m)
+    wheel_base: 0.26            # 车辆轴距 (m)
+    max_steer: 0.4              # 最大转向角 (弧度)
+    max_vel: 0.5                # 最大速度 (m/s)
+    in_test: false              # 是否在测试模式下运行
+
+  alm_traj_opt:
+    rho_T: 100000.0             # 轨迹优化的时间权重
+    rho_ter: 10.0               # 轨迹优化的地形权重
+    max_vel: 0.5                # 最大速度 (m/s)
+    max_acc_lon: 5.0            # 最大纵向加速度 (m/s^2)
+    max_acc_lat: 10.0           # 最大横向加速度 (m/s^2)
+    max_kap: 2.1                # 最大曲率 (1/m)
+    min_cxi: 0.8                # 最小法向量 (无量纲)
+    max_sig: 0.05               # 最大侧向位移 (m)
+    use_scaling: true           # 是否使用缩放因子
+    rho: 1.0                    # 轨迹优化的缩放因子
+    beta: 1000.0                # 轨迹优化的beta参数
+    gamma: 1.0                  # 轨迹优化的gamma参数
+    epsilon_con: 0.001          # 轨迹优化的约束松弛参数
+    max_iter: 10                # 轨迹优化的最大迭代次数
+    g_epsilon: 1.0e-03          # 轨迹优化的梯度容忍度
+    min_step: 1.0e-32           # 轨迹优化的最小步长
+    inner_max_iter: 100000       # 轨迹优化的内层最大迭代次数
+    delta: 1.0e-4               # 轨迹优化的delta参数
+    mem_size: 256               # 轨迹优化的内存大小
+    past: 3                     # 轨迹优化的过去时间窗口
+    int_K: 16                   # 轨迹优化的积分时间窗口
+    in_test: false              # 是否在测试模式下运行
+    in_debug: false             # 是否在调试模式下运行
+
+  manager:
+    piece_len: 0.3              # 轨迹片段长度 (m)
+    mean_vel: 0.5               # 平均速度 (m/s)
+    init_time_times: 1.2        # 轨迹片段初始时间倍数
+    yaw_piece_times: 2.0        # 轨迹片段yaw角度变化倍数
+    init_sig_vel: 0.05          # 初始侧向位移速度 (m/s)
+    # 轨迹优化控制参数
+    enable_optimization: true   # 是否启用轨迹优化
+    # 轨迹重采样参数
+    resample_points: 12         # 重采样后的固定点数
+    # 距离约束参数（注释掉表示None，即不使用该约束）
+    # min_planning_distance: 3.0  # 暂时禁用最短距离约束
+    max_planning_distance: 40.0  # 最远规划距离 (m)
+
+# 固定位姿参数（放在命名空间外面，使用-999.0表示None，即该分量不固定）
+manager:
+  # start_fixed: [-999.0, -999.0, 1.57]  # 起始点固定值 [x, y, yaw]，-999.0表示不固定
+  # end_fixed: [-999.0, -999.0, 0.0]     # 目标点固定值 [x, y, yaw]，-999.0表示不固定
+
+  start_fixed: [-999.0, -999.0, -999.0]  # 起始点固定值 [x, y, yaw]，-999.0表示不固定
+  end_fixed: [-999.0, -999.0, -999.0]    # 目标点固定值 [x, y, yaw]，-999.0表示不固定

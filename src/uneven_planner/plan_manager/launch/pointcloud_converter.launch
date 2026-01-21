@@ -1,0 +1,7 @@
+<launch>
+    <!-- Point Cloud to Grid Converter Service -->
+    <node name="pointcloud_to_grid_converter" pkg="plan_manager" type="pointcloud_to_grid_converter_node" output="screen">
+        <param name="grid_coarse_resolution" value="0.4"/>
+        <param name="voxel_size" value="0.2"/>
+    </node>
+</launch>

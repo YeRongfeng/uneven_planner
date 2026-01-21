@@ -1,0 +1,9 @@
+*.p
+*.map
+*.pcd
+build/
+devel/
+dataset/
+.vscode/
+src/uneven_planner/plan_manager/datasets/
+src/uneven_planner/plan_manager/data/
