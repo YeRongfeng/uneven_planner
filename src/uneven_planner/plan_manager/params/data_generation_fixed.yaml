@@ -65,7 +65,7 @@ manager:
   resample_points: 22         # 重新采样点数 (无量纲)
   # min_planning_distance: 4.5  # 最小规划距离 (m)
   # max_planning_distance: 6.0  # 最大规划距离 (m)
-  min_planning_distance: 20.0  # 最小规划距离 (m)
+  min_planning_distance: 16.0  # 最小规划距离 (m)
   max_planning_distance: 100.0  # 最大规划距离 (m)
   start_fixed: [-999.0, -999.0, -999.0]  # 固定起点 (m, m, rad)
   end_fixed: [-999.0, -999.0, -999.0]    # 固定终点 (m, m, rad)

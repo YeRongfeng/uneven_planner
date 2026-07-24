@@ -1,0 +1,120 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 地形数据集生成器参数 -->
+    <arg name="num_environments" default="2" doc="要生成的环境数量"/>
+    <arg name="train_paths_per_env" default="10" doc="每个环境的训练路径数量"/>
+    <arg name="val_paths_per_env" default="100" doc="每个环境的验证路径数量"/>
+    <arg name="dataset_dir" default="$(find plan_manager)/datasets/sim_dataset" doc="数据集输出目录"/>
+    <arg name="start_env_id" default="15" doc="起始环境ID"/>
+    
+    <!-- 地形生成参数 -->
+    <arg name="map_size" default="10.0" doc="地图尺寸（米）"/>
+    <arg name="map_resolution" default="0.02" doc="地形网格分辨率（米）"/>
+    <arg name="max_height" default="2.0" doc="最大高度（米）"/>
+    <arg name="min_height" default="-2.0" doc="最小高度（米）"/>
+    
+    <!-- 外部地图参数 -->
+    <arg name="use_external_map" default="true" doc="是否使用外部地图文件"/>
+    <!-- <arg name="external_map_path" default="/home/yrf/uneven_planner/src/uneven_planner/uneven_map/maps/map_my.pcd" doc="外部地图文件路径"/> -->
+    <arg name="external_map_path" default="/home/yrf/uneven_planner/src/uneven_planner/uneven_map/maps/map_mountain_40m.pcd" doc="外部地图文件路径"/>
+    <arg name="external_map_format" default="pcd" doc="外部地图格式：pcd、ply、txt、heightmap"/>
+    <arg name="target_map_size" default="40.0" doc="目标地图尺寸（米），用于外部地图裁剪"/>
+    <arg name="target_resolution" default="0.4" doc="目标分辨率（米），用于外部地图处理"/>
+    
+    <!-- 地图转换参数 -->
+    <arg name="coarse_resolution" default="0.2" doc="粗糙栅格分辨率（米）"/>
+    <arg name="fine_resolution" default="0.1" doc="精细栅格分辨率（米）"/>
+    <arg name="voxel_size" default="0.1" doc="体素降采样大小（米）"/>
+    
+    <!-- 路径生成参数 -->
+    <arg name="min_distance" default="5.0" doc="起点和终点之间的最小距离（米）"/>
+    <arg name="publish_delay" default="0.1" doc="发布延迟（秒）"/>
+    
+    <!-- 地图文件参数 -->
+    <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd" doc="PCD地图文件路径"/>
+    <arg name="map_file" default="" doc="预计算地图文件路径（为空时自动生成）"/>
+    
+    <!-- 规划管理器参数 -->
+    <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml" command="load" subst_value="true"/>
+    
+    <!-- 启动点云到栅格地图转换服务（C++实现） -->
+    <node name="pointcloud_to_grid_converter" pkg="plan_manager" type="pointcloud_to_grid_converter_node" output="screen">
+        <param name="grid_coarse_resolution" value="0.4"/>
+        <param name="voxel_size" value="0.2"/>
+    </node>
+    
+    <!-- 启动不平坦地形映射节点 -->
+    <node name="uneven_map" pkg="uneven_map" type="uneven_map_node" output="screen">
+        <!-- 禁用文件加载，改为订阅点云消息 -->
+        <param name="enable_pointcloud_subscriber" value="true"/>
+        <param name="pointcloud_topic" value="/uneven_map/pointcloud"/>
+        <remap from="~pointcloud" to="/uneven_map/pointcloud"/>
+        
+        <!-- 地图文件参数 -->
+        <param name="map_pcd" value="$(arg map_pcd)"/>
+        <param name="map_file" value="$(arg map_file)"/>
+
+        <!-- 新增：使用外部占用栅格订阅配置 -->
+        <param name="use_external_occ_subscriber" value="true"/>
+        <param name="occ_topic" value="/external_occ_grid_hwy"/>
+        <param name="occ_threshold" value="50"/> <!-- 占用栅格阈值 -->
+    </node>
+    
+    <!-- 启动only_planner节点 -->
+    <node name="only_planner" pkg="plan_manager" type="only_planner_node" output="screen">
+        <!-- 使用include方式加载参数，确保正确的命名空间映射 -->
+        <rosparam command="load" file="$(find plan_manager)/params/data_generation_fixed.yaml" subst_value="true"/>
+        
+        <!-- 批量规划开关 -->
+        <param name="manager/batch_planning_enabled" value="true"/>
+        
+        <!-- 规划结果和轨迹发布 -->
+        <remap from="start_pose" to="/data_generate_node/start_pose"/>
+        <remap from="target_pose" to="/data_generate_node/target_pose"/>
+        <remap from="optimized_traj" to="/data_generate_node/optimized_traj"/>
+        <remap from="planning_result" to="/data_generate_node/planning_result"/>
+        
+        <!-- 使用随机位姿生成模式 -->
+        <param name="enable_data_generation_mode" value="true"/>
+    </node>
+    
+    <!-- 启动地形数据集生成器 -->
+    <node name="terrain_dataset_generator" pkg="plan_manager" type="terrain_dataset_generator.py" output="screen" required="false" launch-prefix="python3.10">
+        <!-- 数据集参数 -->
+        <param name="num_environments" value="$(arg num_environments)"/>
+        <param name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
+        <param name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
+        <param name="dataset_dir" value="$(arg dataset_dir)"/>
+        <param name="start_env_id" value="$(arg start_env_id)"/>
+        
+        <!-- 地形生成参数 -->
+        <param name="map_size" value="$(arg map_size)"/>
+        <param name="map_resolution" value="$(arg map_resolution)"/>
+        <param name="max_height" value="$(arg max_height)"/>
+        <param name="min_height" value="$(arg min_height)"/>
+        
+        <!-- 外部地图参数 -->
+        <param name="use_external_map" value="$(arg use_external_map)"/>
+        <param name="external_map_path" value="$(arg external_map_path)"/>
+        <param name="external_map_format" value="$(arg external_map_format)"/>
+        <param name="target_map_size" value="$(arg target_map_size)"/>
+        <param name="target_resolution" value="$(arg target_resolution)"/>
+        
+        <!-- 地图转换参数 -->
+        <param name="coarse_resolution" value="$(arg coarse_resolution)"/>
+        <param name="fine_resolution" value="$(arg fine_resolution)"/>
+        <param name="voxel_size" value="$(arg voxel_size)"/>
+        
+        <!-- 路径生成参数 -->
+        <param name="min_distance" value="$(arg min_distance)"/>
+        <param name="publish_delay" value="$(arg publish_delay)"/>
+        
+        <!-- 地图更新超时时间 -->
+        <param name="map_update_timeout" value="10.0"/>
+    </node>
+    
+    <!-- 启动RViz进行可视化（可选）-->
+    <arg name="enable_rviz" default="false"/>
+    <node if="$(arg enable_rviz)" name="rviz" pkg="rviz" type="rviz" 
+          args="-d $(find plan_manager)/rviz/terrain_dataset_generation.rviz" output="screen"/>
+</launch>

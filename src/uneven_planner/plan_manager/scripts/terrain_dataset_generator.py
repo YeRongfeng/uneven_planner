@@ -2791,15 +2791,15 @@ class TerrainDatasetGenerator:
         
         # 对轨迹进行样条曲线拟合，获得固定数量的控制点
         # 使用轨迹实际长度作为控制点数量，保留所有原始点
-        num_control_points = 20 + 2 # 控制点个数+起点/终点，一共22个点
-        spline_control_points = self.fit_spline_curve(trajectory_path, num_control_points)
+        # num_control_points = 20 + 2 # 控制点个数+起点/终点，一共22个点
+        # spline_control_points = self.fit_spline_curve(trajectory_path, num_control_points)
         
-        if spline_control_points is None:
-            rospy.logwarn(f"Spline fitting failed for path_{self.current_path_id}, retrying...")
-            rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
-            return
+        # if spline_control_points is None:
+        #     rospy.logwarn(f"Spline fitting failed for path_{self.current_path_id}, retrying...")
+        #     rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+        #     return
         
-        rospy.loginfo(f"Spline fitting completed: {len(trajectory_path)} points -> {len(spline_control_points)} control points")
+        # rospy.loginfo(f"Spline fitting completed: {len(trajectory_path)} points -> {len(spline_control_points)} control points")
         
         # 确定当前环境目录
         env_name = f"env{self.current_env_id:06d}"
@@ -2811,9 +2811,9 @@ class TerrainDatasetGenerator:
         # 确保目录存在
         os.makedirs(env_dir, exist_ok=True)
         
-        # 创建路径数据，使用样条控制点
+        # 创建路径数据，直接使用完整轨迹（不进行样条拟合）
         path_data = {
-            'path': spline_control_points,  # 使用样条控制点
+            'path': trajectory_path,  # 使用完整的原始轨迹
             'map_name': env_name
         }
         
@@ -2822,7 +2822,7 @@ class TerrainDatasetGenerator:
         with open(path_file, 'wb') as f:
             pickle.dump(path_data, f)
         
-        rospy.loginfo(f"Saved {path_file} with {len(spline_control_points)} spline control points")
+        rospy.loginfo(f"Saved {path_file} with {len(trajectory_path)} original trajectory points")
         
         # 更新计数
         self.current_path_id += 1

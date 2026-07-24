@@ -413,37 +413,10 @@ namespace uneven_planner
             return;
         }
 
-        // 检查起始点和目标点之间的距离是否在允许范围内
-        double distance = sqrt(pow(end_state(0) - odom_pos(0), 2) + pow(end_state(1) - odom_pos(1), 2));
-
-        // 检查最短距离约束（如果启用）
-        if (use_min_distance_constraint && distance < min_planning_distance) {
-            ROS_WARN("Distance %.3f is too short (min: %.3f), retrying with new poses",
-                     distance, min_planning_distance);
-            in_plan = false;
-            std_msgs::Bool failure_msg;
-            failure_msg.data = false;
-            success_pub.publish(failure_msg);
-            planWithRandomPoses();
-            return;
-        }
-
-        // 检查最远距离约束（如果启用）
-        if (use_max_distance_constraint && distance > max_planning_distance) {
-            ROS_WARN("Distance %.3f is too far (max: %.3f), retrying with new poses",
-                     distance, max_planning_distance);
-            in_plan = false;
-            std_msgs::Bool failure_msg;
-            failure_msg.data = false;
-            success_pub.publish(failure_msg);
-            planWithRandomPoses();
-            return;
-        }
-
         // 调试信息
-        ROS_INFO("Planning from [%.3f, %.3f, %.3f] to [%.3f, %.3f, %.3f] (boundary and distance check passed, distance=%.3f)",
+        ROS_INFO("Planning from [%.3f, %.3f, %.3f] to [%.3f, %.3f, %.3f] (boundary check passed)",
                  odom_pos(0), odom_pos(1), odom_pos(2),
-                 end_state(0), end_state(1), end_state(2), distance);
+                 end_state(0), end_state(1), end_state(2));
 
         // 添加保护性检查，避免崩溃
         if (!kino_astar) {
@@ -593,6 +566,39 @@ namespace uneven_planner
             handlePlanningFailure();
             return;
         }
+
+        // 计算实际轨迹长度
+        double trajectory_length = 0.0;
+        for (size_t i = 0; i < init_path.size() - 1; i++) {
+            trajectory_length += (init_path[i+1].head(2) - init_path[i].head(2)).norm();
+        }
+
+        ROS_INFO("A* trajectory length: %.3f meters", trajectory_length);
+
+        // 检查轨迹长度是否满足约束条件
+        if (use_min_distance_constraint && trajectory_length < min_planning_distance) {
+            ROS_WARN("Trajectory length %.3f is too short (min: %.3f), retrying with new poses",
+                     trajectory_length, min_planning_distance);
+            in_plan = false;
+            std_msgs::Bool failure_msg;
+            failure_msg.data = false;
+            success_pub.publish(failure_msg);
+            planWithRandomPoses();
+            return;
+        }
+
+        if (use_max_distance_constraint && trajectory_length > max_planning_distance) {
+            ROS_WARN("Trajectory length %.3f is too far (max: %.3f), retrying with new poses",
+                     trajectory_length, max_planning_distance);
+            in_plan = false;
+            std_msgs::Bool failure_msg;
+            failure_msg.data = false;
+            success_pub.publish(failure_msg);
+            planWithRandomPoses();
+            return;
+        }
+
+        ROS_INFO("Trajectory length check passed: %.3f meters", trajectory_length);
 
         // 修复：检查A*生成的轨迹是否有超出地图边界的点
         // 如果有超出边界的点，标记为失败并重新生成
