@@ -82,13 +82,12 @@ namespace uneven_planner
         }
         
         Eigen::Vector3d end_pt(end_state.head(3));
-        // if (uneven_map->isOccupancy(end_state) == 1)
         if (uneven_map->isOccupancy(start_state) == 1)
         {
             ROS_ERROR("start is not free!!!");
             return front_end_path;
         }
-        if (uneven_map->isOccupancyXY(end_state) == 1)
+        if (uneven_map->isOccupancy(end_state) == 1)
         {
             ROS_ERROR("goal is not free!!!");
             return front_end_path;
@@ -175,8 +174,7 @@ namespace uneven_planner
                 for (double t = temp_ct; t <= time_interval+1e-3; t+=temp_ct)
                 {
                     stateTransit(cur_state, xt, input, t);
-                    // occ = uneven_map->isOccupancy(xt);
-                    occ = uneven_map->isOccupancyXY(xt);
+                    occ = uneven_map->isOccupancy(xt);
 
                     if (occ == 1)
                         break;

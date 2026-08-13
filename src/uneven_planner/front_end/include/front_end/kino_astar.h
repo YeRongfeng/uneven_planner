@@ -259,8 +259,7 @@ namespace uneven_planner
 
         for (size_t i=0; i<shot_path.size(); i++)
         {
-            // if (uneven_map->isOccupancy(shot_path[i])==1)
-            if (uneven_map->isOccupancyXY(shot_path[i])==1)
+            if (uneven_map->isOccupancy(shot_path[i])==1)
             {
                 shot_path.clear();
                 break;

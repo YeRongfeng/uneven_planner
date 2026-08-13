@@ -1,3 +1,5 @@
+roslaunch plan_manager terrain_dataset_generation_parallel.launch parallel_workers:=8
+
 # uneven_planner
 
 ## Quick Start

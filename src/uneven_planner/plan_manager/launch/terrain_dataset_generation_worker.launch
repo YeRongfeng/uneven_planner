@@ -1,0 +1,101 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 由terrain_dataset_generation_parallel.launch包含，不建议直接运行。 -->
+    <arg name="worker_index"/>
+    <arg name="parallel_workers"/>
+    <arg name="num_environments"/>
+    <arg name="train_paths_per_env"/>
+    <arg name="val_paths_per_env"/>
+    <arg name="dataset_dir"/>
+    <arg name="start_env_id"/>
+
+    <arg name="map_size"/>
+    <arg name="map_resolution"/>
+    <arg name="max_height"/>
+    <arg name="min_height"/>
+    <arg name="use_external_map"/>
+    <arg name="external_map_path"/>
+    <arg name="external_map_paths"/>
+    <arg name="external_map_format"/>
+    <arg name="target_map_size"/>
+    <arg name="target_resolution"/>
+    <arg name="external_map_physical_size"/>
+    <arg name="external_map_min_physical_size"/>
+    <arg name="scale_external_map_z"/>
+    <arg name="external_map_fixed_yaw_deg"/>
+    <arg name="crop_rotation_min_deg"/>
+    <arg name="crop_rotation_max_deg"/>
+    <arg name="crop_padding"/>
+    <arg name="crop_min_points"/>
+    <arg name="crop_min_coverage"/>
+    <arg name="crop_max_attempts"/>
+    <arg name="crop_random_seed"/>
+
+    <arg name="coarse_resolution"/>
+    <arg name="fine_resolution"/>
+    <arg name="voxel_size"/>
+    <arg name="min_distance"/>
+    <arg name="publish_delay"/>
+    <arg name="prefilter_stable_poses"/>
+    <arg name="pose_sampling_max_attempts"/>
+    <arg name="medium_distance_fraction"/>
+    <arg name="long_distance_fraction"/>
+    <arg name="moderate_complexity_fraction"/>
+    <arg name="high_complexity_fraction"/>
+    <arg name="map_ready_delay"/>
+    <arg name="max_path_retries_before_regenerate"/>
+    <arg name="map_pcd"/>
+    <arg name="map_file"/>
+
+    <group ns="dataset_worker_$(arg worker_index)"
+           if="$(eval int(arg('worker_index')) &lt; int(arg('parallel_workers')) and int(arg('worker_index')) &lt; int(arg('num_environments')))">
+        <include file="$(find plan_manager)/launch/terrain_dataset_generation.launch">
+            <arg name="num_environments"
+                 value="$(eval int(arg('num_environments')) // int(arg('parallel_workers')) + (1 if int(arg('worker_index')) &lt; int(arg('num_environments')) % int(arg('parallel_workers')) else 0))"/>
+            <arg name="start_env_id"
+                 value="$(eval int(arg('start_env_id')) + int(arg('worker_index')) * (int(arg('num_environments')) // int(arg('parallel_workers'))) + min(int(arg('worker_index')), int(arg('num_environments')) % int(arg('parallel_workers'))))"/>
+            <arg name="crop_random_seed"
+                 value="$(eval -1 if int(arg('crop_random_seed')) &lt; 0 else int(arg('crop_random_seed')) + int(arg('worker_index')))"/>
+            <arg name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
+            <arg name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
+            <arg name="dataset_dir" value="$(arg dataset_dir)"/>
+            <arg name="map_size" value="$(arg map_size)"/>
+            <arg name="map_resolution" value="$(arg map_resolution)"/>
+            <arg name="max_height" value="$(arg max_height)"/>
+            <arg name="min_height" value="$(arg min_height)"/>
+            <arg name="use_external_map" value="$(arg use_external_map)"/>
+            <arg name="external_map_path" value="$(arg external_map_path)"/>
+            <arg name="external_map_paths" value="$(arg external_map_paths)"/>
+            <arg name="external_map_format" value="$(arg external_map_format)"/>
+            <arg name="target_map_size" value="$(arg target_map_size)"/>
+            <arg name="target_resolution" value="$(arg target_resolution)"/>
+            <arg name="external_map_physical_size" value="$(arg external_map_physical_size)"/>
+            <arg name="external_map_min_physical_size" value="$(arg external_map_min_physical_size)"/>
+            <arg name="scale_external_map_z" value="$(arg scale_external_map_z)"/>
+            <arg name="external_map_fixed_yaw_deg" value="$(arg external_map_fixed_yaw_deg)"/>
+            <arg name="crop_rotation_min_deg" value="$(arg crop_rotation_min_deg)"/>
+            <arg name="crop_rotation_max_deg" value="$(arg crop_rotation_max_deg)"/>
+            <arg name="crop_padding" value="$(arg crop_padding)"/>
+            <arg name="crop_min_points" value="$(arg crop_min_points)"/>
+            <arg name="crop_min_coverage" value="$(arg crop_min_coverage)"/>
+            <arg name="crop_max_attempts" value="$(arg crop_max_attempts)"/>
+            <arg name="coarse_resolution" value="$(arg coarse_resolution)"/>
+            <arg name="fine_resolution" value="$(arg fine_resolution)"/>
+            <arg name="voxel_size" value="$(arg voxel_size)"/>
+            <arg name="min_distance" value="$(arg min_distance)"/>
+            <arg name="publish_delay" value="$(arg publish_delay)"/>
+            <arg name="prefilter_stable_poses" value="$(arg prefilter_stable_poses)"/>
+            <arg name="pose_sampling_max_attempts" value="$(arg pose_sampling_max_attempts)"/>
+            <arg name="medium_distance_fraction" value="$(arg medium_distance_fraction)"/>
+            <arg name="long_distance_fraction" value="$(arg long_distance_fraction)"/>
+            <arg name="moderate_complexity_fraction" value="$(arg moderate_complexity_fraction)"/>
+            <arg name="high_complexity_fraction" value="$(arg high_complexity_fraction)"/>
+            <arg name="map_ready_delay" value="$(arg map_ready_delay)"/>
+            <arg name="max_path_retries_before_regenerate" value="$(arg max_path_retries_before_regenerate)"/>
+            <arg name="map_pcd" value="$(arg map_pcd)"/>
+            <arg name="map_file" value="$(arg map_file)"/>
+            <arg name="enable_standalone_uneven_map" value="false"/>
+            <arg name="enable_rviz" value="false"/>
+        </include>
+    </group>
+</launch>

@@ -10,6 +10,7 @@
 #include <queue>
 #include <atomic>
 #include <chrono>
+#include <sstream>
 
 #include <ros/ros.h>
 #include <ros/console.h>
@@ -28,6 +29,8 @@
 #include "front_end/kino_astar.h"
 #include "back_end/alm_traj_opt.h"
 #include "mpc_controller/SE2Traj.h"
+#include "plan_manager/UpdateTerrainMap.h"
+#include "plan_manager/QueryTerrainMap.h"
 
 namespace uneven_planner
 {
@@ -46,6 +49,7 @@ namespace uneven_planner
             bool in_plan = false;
             std::atomic<bool> batch_planning_enabled{false};  // 批量规划开关
             std::mutex planning_mutex;  // 保护规划状态的互斥锁
+            std::recursive_mutex map_lifecycle_mutex;  // 地图替换与规划/查询不能交错
             std::queue<PlanningRequest> planning_queue;  // 规划请求队列
             
             double piece_len;
@@ -71,6 +75,7 @@ namespace uneven_planner
             int max_pose_retries;      // 最大起终点重试次数
             int map_retry_count;       // 当前地图重新生成次数  
             int max_map_retries;       // 最大地图重新生成次数
+            bool internal_retry_on_failure;  // 是否由规划器内部自行生成新位姿重试
 
             Eigen::Vector3d odom_pos;
             string bk_dir;
@@ -96,6 +101,11 @@ namespace uneven_planner
             visualization_msgs::Marker      zb_msg;    
             bool                            map_ready = false;
             ros::ServiceServer              start_data_srv;   // service to trigger data generation
+            ros::ServiceServer              terrain_update_srv;
+            ros::ServiceServer              terrain_query_srv;
+            uint64_t                        map_version = 0;
+            uint64_t                        last_map_request_id = 0;
+            uint32_t                        active_environment_id = 0;
 
             // 私有辅助函数
             mpc_controller::SE2Traj createTrajectoryMsg(const SE2Trajectory& traj);
@@ -127,6 +137,12 @@ namespace uneven_planner
             void occMapCallback(const nav_msgs::OccupancyGridConstPtr& msg);
             // service callback to trigger startDataGeneration externally
             bool startDataGenerationSrv(std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res);
+            bool updateTerrainMapSrv(
+                plan_manager::UpdateTerrainMap::Request& req,
+                plan_manager::UpdateTerrainMap::Response& res);
+            bool queryTerrainMapSrv(
+                plan_manager::QueryTerrainMap::Request& req,
+                plan_manager::QueryTerrainMap::Response& res);
 
             // 数据生成接口
             void startDataGeneration();

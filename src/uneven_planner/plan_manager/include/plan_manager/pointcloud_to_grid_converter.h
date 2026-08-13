@@ -28,9 +28,9 @@ private:
     ros::NodeHandle nh_;
     ros::ServiceServer convert_service_;
     
-    float grid_coarse_resolution_;  // 粗分辨率（0.4m）用于栅格化
-    float grid_fine_resolution_;    // 精细分辨率（0.2m）用于最终输出  
-    float voxel_size_;              // 体素降采样大小（0.2m）
+    float grid_coarse_resolution_;  // 用于点云聚合的粗分辨率
+    float grid_fine_resolution_;    // 返回栅格的最终分辨率
+    float voxel_size_;              // 点云体素降采样大小
     
     PointCloud<PointType>::Ptr processed_pts_;
     PointCloud<Normal>::Ptr cloud_normals_;

@@ -1,54 +1,84 @@
 <?xml version="1.0"?>
 <launch>
     <!-- 地形数据集生成器参数 -->
-    <arg name="num_environments" default="2" doc="要生成的环境数量"/>
-    <arg name="train_paths_per_env" default="10" doc="每个环境的训练路径数量"/>
-    <arg name="val_paths_per_env" default="100" doc="每个环境的验证路径数量"/>
-    <arg name="dataset_dir" default="$(find plan_manager)/datasets/sim_dataset" doc="数据集输出目录"/>
-    <arg name="start_env_id" default="15" doc="起始环境ID"/>
+    <arg name="num_environments" default="50" doc="要生成的环境数量"/>
+    <arg name="train_paths_per_env" default="200" doc="每个环境的训练路径数量"/>
+    <arg name="val_paths_per_env" default="20" doc="每个环境的验证路径数量"/>
+    <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset20" doc="数据集输出目录"/>
+    <arg name="start_env_id" default="50" doc="起始环境ID"/>
     
     <!-- 地形生成参数 -->
-    <arg name="map_size" default="10.0" doc="地图尺寸（米）"/>
+    <arg name="map_size" default="20.0" doc="地图尺寸（米）"/>
     <arg name="map_resolution" default="0.02" doc="地形网格分辨率（米）"/>
     <arg name="max_height" default="2.0" doc="最大高度（米）"/>
     <arg name="min_height" default="-2.0" doc="最小高度（米）"/>
     
     <!-- 外部地图参数 -->
     <arg name="use_external_map" default="true" doc="是否使用外部地图文件"/>
-    <!-- <arg name="external_map_path" default="/home/yrf/uneven_planner/src/uneven_planner/uneven_map/maps/map_my.pcd" doc="外部地图文件路径"/> -->
-    <arg name="external_map_path" default="/home/yrf/uneven_planner/src/uneven_planner/uneven_map/maps/map_mountain_40m.pcd" doc="外部地图文件路径"/>
+    <arg name="external_map_path" default="$(find uneven_map)/maps/map_my.pcd" doc="兼容旧调用的单个外部地图路径"/>
+    <arg name="external_map_paths" default="" doc="逗号分隔的外部地图列表；为空时兼容使用external_map_path"/>
     <arg name="external_map_format" default="pcd" doc="外部地图格式：pcd、ply、txt、heightmap"/>
-    <arg name="target_map_size" default="40.0" doc="目标地图尺寸（米），用于外部地图裁剪"/>
-    <arg name="target_resolution" default="0.4" doc="目标分辨率（米），用于外部地图处理"/>
+    <arg name="target_map_size" default="20.0" doc="旋转裁剪后的目标地图尺寸（米）"/>
+    <arg name="target_resolution" default="0.2" doc="目标栅格分辨率（米），20/0.2=100"/>
+    <arg name="external_map_physical_size" default="0.0" doc="原始点云横向物理尺寸（米）；0表示源坐标已经是米，不缩放"/>
+    <arg name="external_map_min_physical_size" default="0.0" doc="仅将过小源地图的较短边放大到该尺寸；0表示禁用，内置多地图池使用26.0"/>
+    <arg name="scale_external_map_z" default="false" doc="缩放XY时是否同时缩放高度；米制地图应为false"/>
+    <arg name="external_map_fixed_yaw_deg" default="180.0" doc="外部地图加载后的固定坐标系旋转（度）"/>
+    <arg name="crop_rotation_min_deg" default="-180.0" doc="随机裁剪旋转角下限（度）"/>
+    <arg name="crop_rotation_max_deg" default="180.0" doc="随机裁剪旋转角上限（度）"/>
+    <arg name="crop_padding" default="1.0" doc="裁剪边缘额外保留范围（米），用于法向量估计"/>
+    <arg name="crop_min_points" default="50" doc="20m目标区域内允许的最少点数"/>
+    <arg name="crop_min_coverage" default="0.85" doc="目标区域粗栅格的最低点云覆盖率"/>
+    <arg name="crop_max_attempts" default="50" doc="寻找有效随机裁剪区域的最大次数"/>
+    <arg name="crop_random_seed" default="-1" doc="随机裁剪种子；-1表示每次随机"/>
     
     <!-- 地图转换参数 -->
-    <arg name="coarse_resolution" default="0.2" doc="粗糙栅格分辨率（米）"/>
-    <arg name="fine_resolution" default="0.1" doc="精细栅格分辨率（米）"/>
-    <arg name="voxel_size" default="0.1" doc="体素降采样大小（米）"/>
+    <arg name="coarse_resolution" default="0.2" doc="点云聚合栅格分辨率（米），与最终输出一致以保留真实100x100细节"/>
+    <arg name="fine_resolution" default="0.2" doc="最终输出栅格分辨率（米）"/>
+    <arg name="voxel_size" default="0.2" doc="体素降采样大小（米）"/>
     
     <!-- 路径生成参数 -->
     <arg name="min_distance" default="5.0" doc="起点和终点之间的最小距离（米）"/>
     <arg name="publish_delay" default="0.1" doc="发布延迟（秒）"/>
+    <arg name="prefilter_stable_poses" default="true" doc="规划前使用yaw稳定性图筛选起终点"/>
+    <arg name="pose_sampling_max_attempts" default="1000" doc="低成本起终点分层筛选的最大抽样次数"/>
+    <arg name="medium_distance_fraction" default="0.4" doc="中距离轨迹比例；剩余比例为短距离"/>
+    <arg name="long_distance_fraction" default="0.4" doc="长距离轨迹比例"/>
+    <arg name="moderate_complexity_fraction" default="0.4" doc="中等朝向难度轨迹比例；剩余比例为简单轨迹"/>
+    <arg name="high_complexity_fraction" default="0.4" doc="高朝向难度轨迹比例"/>
+    <arg name="map_ready_delay" default="1.0" doc="发布新地图后开始规划前的非阻塞等待时间（秒）"/>
+    <arg name="max_path_retries_before_regenerate" default="30" doc="单条路径连续失败多少次后重新裁剪当前环境；小于等于0表示禁用"/>
     
     <!-- 地图文件参数 -->
     <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd" doc="PCD地图文件路径"/>
     <arg name="map_file" default="" doc="预计算地图文件路径（为空时自动生成）"/>
+    <arg name="enable_standalone_uneven_map" default="false" doc="是否启动仅用于可视化的独立uneven_map节点；数据生成默认只使用only_planner内嵌实例"/>
     
     <!-- 规划管理器参数 -->
     <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml" command="load" subst_value="true"/>
+    <!--
+      UnevenMap由only_planner使用普通NodeHandle读取这些参数，因此它们必须
+      位于当前worker的uneven_map命名空间。不能依赖可选的独立uneven_map
+      节点顺带创建参数，否则关闭该可视化节点后会向PCL传入空点云。
+    -->
+    <param name="uneven_map/map_pcd" value="$(arg map_pcd)"/>
+    <param name="uneven_map/map_file" value="$(arg map_file)"/>
+    <param name="uneven_map/use_external_occ_subscriber" value="true"/>
+    <param name="uneven_map/occ_topic" value="external_occ_grid_hwy"/>
+    <param name="uneven_map/occ_threshold" value="50"/>
     
     <!-- 启动点云到栅格地图转换服务（C++实现） -->
     <node name="pointcloud_to_grid_converter" pkg="plan_manager" type="pointcloud_to_grid_converter_node" output="screen">
-        <param name="grid_coarse_resolution" value="0.4"/>
-        <param name="voxel_size" value="0.2"/>
+        <param name="grid_coarse_resolution" value="$(arg coarse_resolution)"/>
+        <param name="grid_fine_resolution" value="$(arg fine_resolution)"/>
+        <param name="voxel_size" value="$(arg voxel_size)"/>
     </node>
     
     <!-- 启动不平坦地形映射节点 -->
-    <node name="uneven_map" pkg="uneven_map" type="uneven_map_node" output="screen">
+    <node if="$(arg enable_standalone_uneven_map)" name="uneven_map" pkg="uneven_map" type="uneven_map_node" output="screen">
         <!-- 禁用文件加载，改为订阅点云消息 -->
         <param name="enable_pointcloud_subscriber" value="true"/>
-        <param name="pointcloud_topic" value="/uneven_map/pointcloud"/>
-        <remap from="~pointcloud" to="/uneven_map/pointcloud"/>
+        <param name="pointcloud_topic" value="pointcloud"/>
         
         <!-- 地图文件参数 -->
         <param name="map_pcd" value="$(arg map_pcd)"/>
@@ -56,12 +86,13 @@
 
         <!-- 新增：使用外部占用栅格订阅配置 -->
         <param name="use_external_occ_subscriber" value="true"/>
-        <param name="occ_topic" value="/external_occ_grid_hwy"/>
+        <param name="occ_topic" value="external_occ_grid_hwy"/>
         <param name="occ_threshold" value="50"/> <!-- 占用栅格阈值 -->
     </node>
     
     <!-- 启动only_planner节点 -->
-    <node name="only_planner" pkg="plan_manager" type="only_planner_node" output="screen">
+    <node name="only_planner" pkg="plan_manager" type="only_planner_node"
+          output="screen" required="true">
         <!-- 使用include方式加载参数，确保正确的命名空间映射 -->
         <rosparam command="load" file="$(find plan_manager)/params/data_generation_fixed.yaml" subst_value="true"/>
         
@@ -69,10 +100,11 @@
         <param name="manager/batch_planning_enabled" value="true"/>
         
         <!-- 规划结果和轨迹发布 -->
-        <remap from="start_pose" to="/data_generate_node/start_pose"/>
-        <remap from="target_pose" to="/data_generate_node/target_pose"/>
-        <remap from="optimized_traj" to="/data_generate_node/optimized_traj"/>
-        <remap from="planning_result" to="/data_generate_node/planning_result"/>
+        <remap from="start_pose" to="data_generate_node/start_pose"/>
+        <remap from="target_pose" to="data_generate_node/target_pose"/>
+        <remap from="optimized_traj" to="data_generate_node/optimized_traj"/>
+        <remap from="planning_result" to="data_generate_node/planning_result"/>
+        <remap from="map_regeneration_request" to="data_generate_node/map_regeneration_request"/>
         
         <!-- 使用随机位姿生成模式 -->
         <param name="enable_data_generation_mode" value="true"/>
@@ -96,9 +128,21 @@
         <!-- 外部地图参数 -->
         <param name="use_external_map" value="$(arg use_external_map)"/>
         <param name="external_map_path" value="$(arg external_map_path)"/>
+        <param name="external_map_paths" value="$(arg external_map_paths)"/>
         <param name="external_map_format" value="$(arg external_map_format)"/>
         <param name="target_map_size" value="$(arg target_map_size)"/>
         <param name="target_resolution" value="$(arg target_resolution)"/>
+        <param name="external_map_physical_size" value="$(arg external_map_physical_size)"/>
+        <param name="external_map_min_physical_size" value="$(arg external_map_min_physical_size)"/>
+        <param name="scale_external_map_z" value="$(arg scale_external_map_z)"/>
+        <param name="external_map_fixed_yaw_deg" value="$(arg external_map_fixed_yaw_deg)"/>
+        <param name="crop_rotation_min_deg" value="$(arg crop_rotation_min_deg)"/>
+        <param name="crop_rotation_max_deg" value="$(arg crop_rotation_max_deg)"/>
+        <param name="crop_padding" value="$(arg crop_padding)"/>
+        <param name="crop_min_points" value="$(arg crop_min_points)"/>
+        <param name="crop_min_coverage" value="$(arg crop_min_coverage)"/>
+        <param name="crop_max_attempts" value="$(arg crop_max_attempts)"/>
+        <param name="crop_random_seed" value="$(arg crop_random_seed)"/>
         
         <!-- 地图转换参数 -->
         <param name="coarse_resolution" value="$(arg coarse_resolution)"/>
@@ -108,6 +152,15 @@
         <!-- 路径生成参数 -->
         <param name="min_distance" value="$(arg min_distance)"/>
         <param name="publish_delay" value="$(arg publish_delay)"/>
+        <param name="prefilter_stable_poses" value="$(arg prefilter_stable_poses)"/>
+        <param name="pose_sampling_max_attempts" value="$(arg pose_sampling_max_attempts)"/>
+        <param name="medium_distance_fraction" value="$(arg medium_distance_fraction)"/>
+        <param name="long_distance_fraction" value="$(arg long_distance_fraction)"/>
+        <param name="moderate_complexity_fraction" value="$(arg moderate_complexity_fraction)"/>
+        <param name="high_complexity_fraction" value="$(arg high_complexity_fraction)"/>
+        <param name="map_ready_delay" value="$(arg map_ready_delay)"/>
+        <param name="max_path_retries_before_regenerate" value="$(arg max_path_retries_before_regenerate)"/>
+        <param name="planner_connection_timeout" value="60.0"/>
         
         <!-- 地图更新超时时间 -->
         <param name="map_update_timeout" value="10.0"/>

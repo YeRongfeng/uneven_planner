@@ -138,6 +138,11 @@ namespace uneven_planner
         // 初始化重试机制参数
         pose_retry_count = 0;
         max_pose_retries = 5;  // 每个地图最多重试5次起终点
+        nh_private.param<bool>("manager/internal_retry_on_failure",
+                               internal_retry_on_failure, true);
+        ROS_INFO("Retry owner: %s",
+                 internal_retry_on_failure ? "only_planner (internal)"
+                                           : "dataset generator (external)");
 
         ROS_INFO("Loaded parameters: piece_len=%.3f, mean_vel=%.3f, init_time_times=%.3f, yaw_piece_times=%.3f, init_sig_vel=%.3f",
                  piece_len, mean_vel, init_time_times, yaw_piece_times, init_sig_vel);
@@ -275,6 +280,10 @@ namespace uneven_planner
         start_sub = nh.subscribe<geometry_msgs::PoseStamped>("start_pose", 1, &OnlyPlanner::rcvStartPoseCallBack, this);  // 起始点订阅者
         target_sub = nh.subscribe<geometry_msgs::PoseStamped>("target_pose", 1, &OnlyPlanner::rcvWpsCallBack, this);  // 目标订阅者
         // 注册 service 以便从外部触发数据生成（例如 terrain_dataset_generator.py）
+        terrain_update_srv = nh.advertiseService(
+            "update_terrain_map", &OnlyPlanner::updateTerrainMapSrv, this);
+        terrain_query_srv = nh.advertiseService(
+            "query_terrain_map", &OnlyPlanner::queryTerrainMapSrv, this);
         // NOTE: service "start_data_generation" already created in only_planner_node.cpp.
         // To avoid duplicate advertisement in the same process/node, do not register it here.
         // If you want this class to own the service instead, remove the advertise in only_planner_node.cpp.
@@ -286,7 +295,130 @@ namespace uneven_planner
         ROS_INFO("  - Subscribed to start_pose: %s", start_sub.getTopic().c_str());
         ROS_INFO("  - Subscribed to target_pose: %s", target_sub.getTopic().c_str());
 
+        ROS_INFO("  - Atomic map update service: %s",
+                 terrain_update_srv.getService().c_str());
         return;
+    }
+
+    bool OnlyPlanner::updateTerrainMapSrv(
+        plan_manager::UpdateTerrainMap::Request& req,
+        plan_manager::UpdateTerrainMap::Response& res)
+    {
+        std::lock_guard<std::recursive_mutex> lifecycle_guard(map_lifecycle_mutex);
+        res.success = false;
+        res.request_id = req.request_id;
+        res.environment_id = req.environment_id;
+        res.map_version = map_version;
+        res.point_count = 0;
+        res.occupied_voxel_count = 0;
+        res.occupied_xy_count = 0;
+        res.source_height = 0;
+        res.source_width = 0;
+        res.source_yaw_bins = 0;
+        res.internal_yaw_bins = 0;
+        if (req.occupancy_hwy.layout.dim.size() == 3)
+        {
+            res.source_height = req.occupancy_hwy.layout.dim[0].size;
+            res.source_width = req.occupancy_hwy.layout.dim[1].size;
+            res.source_yaw_bins = req.occupancy_hwy.layout.dim[2].size;
+        }
+
+        if (in_plan)
+        {
+            res.message = "planner is busy; map was not changed";
+            return true;
+        }
+        if (req.request_id <= last_map_request_id)
+        {
+            std::ostringstream oss;
+            oss << "request_id must increase monotonically; last="
+                << last_map_request_id << ", received=" << req.request_id;
+            res.message = oss.str();
+            return true;
+        }
+
+        size_t point_count = 0;
+        size_t occupied_voxel_count = 0;
+        size_t occupied_xy_count = 0;
+        string error;
+        try
+        {
+            if (!uneven_map->replaceExternalMap(
+                    req.pointcloud, req.occupancy_hwy,
+                    req.min_x, req.min_y, req.max_x, req.max_y,
+                    req.resolution, point_count, occupied_voxel_count,
+                    occupied_xy_count, error))
+            {
+                res.message = error;
+                return true;
+            }
+        }
+        catch (const std::exception& exc)
+        {
+            res.message = string("map rebuild threw exception: ") + exc.what();
+            return true;
+        }
+
+        last_map_request_id = req.request_id;
+        active_environment_id = req.environment_id;
+        ++map_version;
+        res.success = true;
+        res.map_version = map_version;
+        res.point_count = point_count;
+        res.occupied_voxel_count = occupied_voxel_count;
+        res.occupied_xy_count = occupied_xy_count;
+        double yaw_resolution = 0.1;
+        ros::param::param<double>(
+            ros::this_node::getNamespace() + "/uneven_map/yaw_resolution",
+            yaw_resolution, 0.1);
+        res.internal_yaw_bins = static_cast<uint32_t>(
+            std::ceil((2.0 * M_PI + 5e-2) / yaw_resolution));
+        std::ostringstream message;
+        message << "applied environment " << req.environment_id
+                << " as map version " << map_version;
+        res.message = message.str();
+        ROS_INFO(
+            "Atomic terrain update complete: request=%llu env=%u version=%llu "
+            "points=%zu occupied_se2=%zu occupied_xy=%zu",
+            static_cast<unsigned long long>(req.request_id),
+            req.environment_id,
+            static_cast<unsigned long long>(map_version),
+            point_count, occupied_voxel_count, occupied_xy_count);
+        return true;
+    }
+
+    bool OnlyPlanner::queryTerrainMapSrv(
+        plan_manager::QueryTerrainMap::Request& req,
+        plan_manager::QueryTerrainMap::Response& res)
+    {
+        std::lock_guard<std::recursive_mutex> lifecycle_guard(map_lifecycle_mutex);
+        res.success = false;
+        res.environment_id = active_environment_id;
+        res.map_version = map_version;
+        if (!uneven_map || !uneven_map->mapReady())
+        {
+            res.message = "terrain map is not ready";
+            return true;
+        }
+        const Eigen::Vector3d pose(req.x, req.y, req.yaw);
+        if (!uneven_map->isInMap(pose))
+        {
+            res.message = "query pose is outside the terrain map";
+            return true;
+        }
+        RXS2 terrain;
+        uneven_map->getTerrain(pose, terrain);
+        res.z = terrain.z;
+        res.sigma = terrain.sigma;
+        res.normal_x = terrain.zb.x();
+        res.normal_y = terrain.zb.y();
+        res.normal_z = std::sqrt(std::max(
+            0.0, 1.0 - terrain.zb.squaredNorm()));
+        res.occupancy_se2 = uneven_map->isOccupancy(pose);
+        res.occupancy_xy = uneven_map->isOccupancyXY(pose);
+        res.success = true;
+        res.message = "ok";
+        return true;
     }
 
     /**
@@ -347,6 +479,7 @@ namespace uneven_planner
      */
     void OnlyPlanner::rcvWpsCallBack(const geometry_msgs::PoseStampedConstPtr& msg)
     {
+        std::lock_guard<std::recursive_mutex> lifecycle_guard(map_lifecycle_mutex);
         // ROS_INFO("=== TARGET POSE CALLBACK TRIGGERED ===");
         // ROS_INFO("Received target pose: [%.3f, %.3f, %.3f]",
         //          msg->pose.position.x, msg->pose.position.y,
@@ -367,6 +500,10 @@ namespace uneven_planner
             }
             if (!uneven_map->mapReady()) {
                 ROS_WARN("Map not ready, skipping target pose");
+                // 外部重试管理器需要明确结果，否则只能等到看门狗超时。
+                std_msgs::Bool failure_msg;
+                failure_msg.data = false;
+                success_pub.publish(failure_msg);
             }
             return;
         }
@@ -395,7 +532,9 @@ namespace uneven_planner
             std_msgs::Bool failure_msg;
             failure_msg.data = false;
             success_pub.publish(failure_msg);
-            planWithRandomPoses();
+            if (internal_retry_on_failure) {
+                planWithRandomPoses();
+            }
             return;
         }
 
@@ -409,7 +548,9 @@ namespace uneven_planner
             failure_msg.data = false;
             success_pub.publish(failure_msg);
             
-            planWithRandomPoses();
+            if (internal_retry_on_failure) {
+                planWithRandomPoses();
+            }
             return;
         }
 
@@ -583,7 +724,9 @@ namespace uneven_planner
             std_msgs::Bool failure_msg;
             failure_msg.data = false;
             success_pub.publish(failure_msg);
-            planWithRandomPoses();
+            if (internal_retry_on_failure) {
+                planWithRandomPoses();
+            }
             return;
         }
 
@@ -594,7 +737,9 @@ namespace uneven_planner
             std_msgs::Bool failure_msg;
             failure_msg.data = false;
             success_pub.publish(failure_msg);
-            planWithRandomPoses();
+            if (internal_retry_on_failure) {
+                planWithRandomPoses();
+            }
             return;
         }
 
@@ -623,7 +768,9 @@ namespace uneven_planner
             failure_msg.data = false;
             success_pub.publish(failure_msg);
             // 立即重新生成位姿并重试
-            planWithRandomPoses();
+            if (internal_retry_on_failure) {
+                planWithRandomPoses();
+            }
             return;
         }
 
@@ -1027,18 +1174,18 @@ namespace uneven_planner
             bool start_free = true;
             bool target_free = true;
             if (uneven_map && uneven_map->mapReady()) {
-                // isInMap + isOccupancyXY: 返回 0 表示 free, 100 表示 occupied, -1 表示不在地图内
+                // 使用完整SE(2) occupancy，保留金字塔安全判据的朝向语义。
                 if (!uneven_map->isInMap(start_pose)) {
                     start_free = false;
                 } else {
-                    int occ = uneven_map->isOccupancyXY(start_pose);
+                    int occ = uneven_map->isOccupancy(start_pose);
                     if (occ != 0) start_free = false;
                 }
 
                 if (!uneven_map->isInMap(target_pose)) {
                     target_free = false;
                 } else {
-                    int occ = uneven_map->isOccupancyXY(target_pose);
+                    int occ = uneven_map->isOccupancy(target_pose);
                     if (occ != 0) target_free = false;
                 }
             }
@@ -1115,8 +1262,11 @@ namespace uneven_planner
         //     return;
         // }
 
-        // 继续重试新的起终点
-        planWithRandomPoses();
+        // 外部数据集生成器工作时，只发布一次失败，由它统一决定何时重试。
+        // 两端同时重试会产生并发规划、过期结果和指数级重试风暴。
+        if (internal_retry_on_failure) {
+            planWithRandomPoses();
+        }
     }
 
     // 启动数据生成过程

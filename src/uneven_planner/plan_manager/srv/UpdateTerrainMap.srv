@@ -1,0 +1,22 @@
+uint64 request_id
+uint32 environment_id
+sensor_msgs/PointCloud2 pointcloud
+std_msgs/Float32MultiArray occupancy_hwy
+float64 min_x
+float64 min_y
+float64 max_x
+float64 max_y
+float64 resolution
+---
+bool success
+uint64 request_id
+uint32 environment_id
+uint64 map_version
+uint64 point_count
+uint64 occupied_voxel_count
+uint64 occupied_xy_count
+uint32 source_height
+uint32 source_width
+uint32 source_yaw_bins
+uint32 internal_yaw_bins
+string message

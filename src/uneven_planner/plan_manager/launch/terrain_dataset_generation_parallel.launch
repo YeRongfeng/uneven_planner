@@ -1,0 +1,73 @@
+<?xml version="1.0"?>
+<launch>
+    <!--
+      进程级并行数据生成。每个worker拥有独立的地图、转换服务和规划器，
+      环境ID按连续且互不重叠的区间自动分配。parallel_workers支持1~8。
+    -->
+    <arg name="parallel_workers" default="4"/>
+    <arg name="num_environments" default="30"/>
+    <arg name="train_paths_per_env" default="200"/>
+    <arg name="val_paths_per_env" default="20"/>
+    <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset1_val"/>
+    <arg name="start_env_id" default="20"/>
+
+    <arg name="map_size" default="20.0"/>
+    <arg name="map_resolution" default="0.02"/>
+    <arg name="max_height" default="2.0"/>
+    <arg name="min_height" default="-2.0"/>
+
+    <arg name="use_external_map" default="true"/>
+    <arg name="external_map_path" default="$(find uneven_map)/maps/map_my.pcd"/>
+    <arg name="external_map_paths" default="$(find uneven_map)/maps/map_my.pcd,$(find uneven_map)/maps/desert.pcd,$(find uneven_map)/maps/forest.pcd,$(find uneven_map)/maps/hill.pcd,$(find uneven_map)/maps/mountain.pcd,$(find uneven_map)/maps/vocano.pcd"/>
+    <arg name="external_map_format" default="pcd"/>
+    <arg name="target_map_size" default="20.0"/>
+    <arg name="target_resolution" default="0.2"/>
+    <arg name="external_map_physical_size" default="0.0"/>
+    <arg name="external_map_min_physical_size" default="26.0"/>
+    <arg name="scale_external_map_z" default="false"/>
+    <arg name="external_map_fixed_yaw_deg" default="180.0"/>
+    <arg name="crop_rotation_min_deg" default="-180.0"/>
+    <arg name="crop_rotation_max_deg" default="180.0"/>
+    <arg name="crop_padding" default="1.0"/>
+    <arg name="crop_min_points" default="50"/>
+    <arg name="crop_min_coverage" default="0.85"/>
+    <arg name="crop_max_attempts" default="50"/>
+    <arg name="crop_random_seed" default="-1"/>
+
+    <arg name="coarse_resolution" default="0.2"/>
+    <arg name="fine_resolution" default="0.2"/>
+    <arg name="voxel_size" default="0.2"/>
+    <arg name="min_distance" default="5.0"/>
+    <arg name="publish_delay" default="0.1"/>
+    <arg name="prefilter_stable_poses" default="true"/>
+    <arg name="pose_sampling_max_attempts" default="1000"/>
+    <arg name="medium_distance_fraction" default="0.4"/>
+    <arg name="long_distance_fraction" default="0.4"/>
+    <arg name="moderate_complexity_fraction" default="0.4"/>
+    <arg name="high_complexity_fraction" default="0.4"/>
+    <arg name="map_ready_delay" default="1.0"/>
+    <arg name="max_path_retries_before_regenerate" default="30"/>
+    <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd"/>
+    <arg name="map_file" default=""/>
+
+    <!--
+      ROS1 XML launch没有循环语法，因此只在这里枚举最多8个轻量worker入口；
+      具体参数分配统一由worker launch处理。
+    -->
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="0"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="1"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="2"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="3"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="4"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="5"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="6"/></include>
+    <include file="$(find plan_manager)/launch/terrain_dataset_generation_worker.launch"
+             pass_all_args="true"><arg name="worker_index" value="7"/></include>
+</launch>

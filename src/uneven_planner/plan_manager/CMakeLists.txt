@@ -27,6 +27,8 @@ find_package(PCL REQUIRED)
 add_service_files(
   FILES
   PointCloudToGrid.srv
+  UpdateTerrainMap.srv
+  QueryTerrainMap.srv
 )
 
 ## Generate added messages and services with any dependencies listed here
@@ -62,6 +64,11 @@ add_library(only_planner_lib
     src/only_planner.cpp
 )
 
+add_dependencies(only_planner_lib
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+    ${catkin_EXPORTED_TARGETS}
+)
+
 target_link_libraries(plan_manager
     ${catkin_LIBRARIES}
     /opt/ros/noetic/lib/x86_64-linux-gnu/libompl.so
@@ -74,6 +81,11 @@ target_link_libraries(only_planner_lib
 
 add_executable(manager_node src/manager_node.cpp )
 add_executable(only_planner_node src/only_planner_node.cpp )
+
+add_dependencies(only_planner_node
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+    ${catkin_EXPORTED_TARGETS}
+)
 
 # PointCloud to Grid Converter
 add_library(pointcloud_to_grid_converter

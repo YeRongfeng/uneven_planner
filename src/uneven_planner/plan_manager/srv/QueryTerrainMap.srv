@@ -1,0 +1,15 @@
+float64 x
+float64 y
+float64 yaw
+---
+bool success
+uint32 environment_id
+uint64 map_version
+float64 z
+float64 sigma
+float64 normal_x
+float64 normal_y
+float64 normal_z
+int32 occupancy_se2
+int32 occupancy_xy
+string message

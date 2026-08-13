@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Non-square maps make an H/W swap observable. Small dimensions keep
+         the full terrain rebuild fast enough for a deterministic smoke test. -->
+    <group ns="dataset_worker_0">
+        <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml"
+                  command="load"/>
+        <param name="uneven_map/map_size_x" value="14.0"/>
+        <param name="uneven_map/map_size_y" value="4.0"/>
+        <param name="uneven_map/xy_resolution" value="0.2"/>
+        <param name="uneven_map/yaw_resolution" value="0.1"/>
+        <param name="uneven_map/iter_num" value="1"/>
+        <param name="uneven_map/map_pcd"
+               value="$(find uneven_map)/maps/empty.pcd"/>
+        <param name="uneven_map/map_file" value=""/>
+        <param name="uneven_map/use_external_occ_subscriber" value="false"/>
+        <node name="only_planner" pkg="plan_manager"
+              type="only_planner_node" output="screen" required="true">
+            <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml"
+                      command="load"/>
+            <param name="manager/enable_optimization" value="false"/>
+            <param name="manager/internal_retry_on_failure" value="false"/>
+        </node>
+    </group>
+
+    <group ns="dataset_worker_1">
+        <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml"
+                  command="load"/>
+        <param name="uneven_map/map_size_x" value="14.0"/>
+        <param name="uneven_map/map_size_y" value="4.0"/>
+        <param name="uneven_map/xy_resolution" value="0.2"/>
+        <param name="uneven_map/yaw_resolution" value="0.1"/>
+        <param name="uneven_map/iter_num" value="1"/>
+        <param name="uneven_map/map_pcd"
+               value="$(find uneven_map)/maps/empty.pcd"/>
+        <param name="uneven_map/map_file" value=""/>
+        <param name="uneven_map/use_external_occ_subscriber" value="false"/>
+        <node name="only_planner" pkg="plan_manager"
+              type="only_planner_node" output="screen" required="true">
+            <rosparam file="$(find plan_manager)/params/data_generation_fixed.yaml"
+                      command="load"/>
+            <param name="manager/enable_optimization" value="false"/>
+            <param name="manager/internal_retry_on_failure" value="false"/>
+        </node>
+    </group>
+</launch>

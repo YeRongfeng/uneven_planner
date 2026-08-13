@@ -4,8 +4,11 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <stdexcept>
 #include <random>
 #include <mutex>
+#include <limits>
+#include <sstream>
 
 #include <ros/ros.h>
 #include <ros/console.h>
@@ -30,6 +33,7 @@
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/crop_box.h>
+#include <pcl/filters/filter.h>
 #include <pcl/kdtree/kdtree_flann.h>
 
 using namespace std;
@@ -118,6 +122,14 @@ namespace uneven_planner
             int occ_threshold = 50;                      // occupancy threshold (0-100)
             std::mutex occ_mutex;                        // protect occ buffers when updated from callback
 
+            bool decodeExternalOccupancy(
+                const std_msgs::Float32MultiArray& msg,
+                vector<char>& decoded_occ,
+                vector<char>& decoded_occ_r2,
+                size_t& occupied_voxel_count,
+                size_t& occupied_xy_count,
+                string& error);
+
         public:
             UnevenMap() {}
             ~UnevenMap() {}
@@ -129,8 +141,21 @@ namespace uneven_planner
 
             void init(ros::NodeHandle& nh);
             bool constructMapInput();
-            bool constructMap();
+            bool constructMap(bool persist_to_file = true);
             void visCallback(const ros::TimerEvent& /*event*/);
+
+            bool replaceExternalMap(
+                const sensor_msgs::PointCloud2& cloud_msg,
+                const std_msgs::Float32MultiArray& occupancy_hwy,
+                double min_x,
+                double min_y,
+                double max_x,
+                double max_y,
+                double resolution,
+                size_t& point_count,
+                size_t& occupied_voxel_count,
+                size_t& occupied_xy_count,
+                string& error);
 
             inline void getTerrain(const Eigen::Vector3d& pos, RXS2& value);
             inline void getTerrainPos(const Eigen::Vector3d& pos, Eigen::Matrix3d& R, Eigen::Vector3d& p);

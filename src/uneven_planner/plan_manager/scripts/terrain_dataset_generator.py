@@ -30,7 +30,12 @@
 
 import rospy
 from std_srvs.srv import Trigger
-from plan_manager.srv import PointCloudToGrid, PointCloudToGridRequest
+from plan_manager.srv import (
+    PointCloudToGrid,
+    PointCloudToGridRequest,
+    UpdateTerrainMap,
+    UpdateTerrainMapRequest,
+)
 
 import numpy as np
 import matplotlib
@@ -44,14 +49,18 @@ import math
 import time
 import os
 import pickle
-import shutil
 import glob
 import cv2
 import tf.transformations as tf_trans
-from scipy.ndimage import gaussian_filter, zoom
+from scipy.ndimage import gaussian_filter, zoom, label as connected_component_label
 from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
 from scipy.special import comb
+
+from stability_validation import (
+    build_periodic_signed_stability_esdf,
+    validate_trajectory_stability,
+)
 
 # ROS消息类型
 from geometry_msgs.msg import PoseStamped
@@ -71,7 +80,7 @@ try:
 except ImportError:
     CUPY_AVAILABLE = False
     print("CuPy not available, using CPU-only processing")
-    
+
 import torch
     
 import torch
@@ -286,12 +295,9 @@ def compute_map_yaw_bins(normal_x, normal_y, normal_z, yaw_bins=18):
         for idx, (i, j) in enumerate(zip(complex_indices[0], complex_indices[1])):
             yaw_stability[i, j, unreachable_mask[idx]] = 0.0
 
-    # 将x和y进行转置
-    yaw_stability = yaw_stability.permute(1, 0, 2)  # (W, H, yaw_bins) -> (H, W, yaw_bins)
-    
-    # # 对x翻转，y翻转以匹配地图坐标系
-    # yaw_stability = torch.flip(yaw_stability, dims=[0])  # 沿H轴翻转
-    # yaw_stability = torch.flip(yaw_stability, dims=[1])  # 沿W轴翻转
+    # C++ converter 以 grid_y * width + grid_x 写入，Python reshape 后已经
+    # 是 (row=y, col=x, yaw)。这里不能再转置 H/W；方形地图会让
+    # shape 检查无法发现该错误。
 
     return yaw_stability
 
@@ -980,13 +986,13 @@ class GridTransformer:
     调用pointcloud_to_grid_converter节点提供的服务
     """
 
-    def __init__(self, coarse_resolution=0.4, fine_resolution=0.2, voxel_size=0.2):
+    def __init__(self, coarse_resolution=0.2, fine_resolution=0.2, voxel_size=0.2):
         """
         初始化GridTransformer
         
         Args:
-            coarse_resolution: 粗糙网格分辨率（0.4m）- C++服务返回此分辨率
-            fine_resolution: 精细网格分辨率（0.2m）- Python端插值到此分辨率
+            coarse_resolution: 点云聚合分辨率（0.2m）- 与最终栅格一致
+            fine_resolution: 精细网格分辨率（0.2m）- C++服务输出分辨率
             voxel_size: 体素降采样大小（0.2m）- C++端使用
         """
         self.coarse_resolution = coarse_resolution
@@ -1007,8 +1013,10 @@ class GridTransformer:
         # 等待C++服务可用
         rospy.loginfo("Waiting for pointcloud_to_grid service...")
         try:
-            rospy.wait_for_service('/pointcloud_to_grid', timeout=10.0)
-            self.grid_service = rospy.ServiceProxy('/pointcloud_to_grid', PointCloudToGrid)
+            # 使用相对名称，使多个数据生成 worker 可以在独立命名空间运行。
+            rospy.wait_for_service('pointcloud_to_grid', timeout=10.0)
+            self.grid_service = rospy.ServiceProxy(
+                'pointcloud_to_grid', PointCloudToGrid)
             rospy.loginfo("GridTransformer initialized with C++ service")
         except rospy.ROSException:
             rospy.logwarn("C++ service not available, using fallback Python implementation")
@@ -1102,7 +1110,7 @@ class GridTransformer:
                 
             rospy.loginfo(f"C++ conversion successful: {response.grid_width}x{response.grid_height} grid at {response.resolution}m resolution")
             
-            # C++已经返回精细分辨率的栅格（205×205），直接使用
+            # C++已经返回精细分辨率的栅格，直接使用
             fine_elevation = np.array(response.elevation_grid).reshape(response.grid_height, response.grid_width)
             fine_normal_x = np.array(response.normal_x_grid).reshape(response.grid_height, response.grid_width)
             fine_normal_y = np.array(response.normal_y_grid).reshape(response.grid_height, response.grid_width)
@@ -1448,17 +1456,76 @@ class TerrainDatasetGenerator:
         # 外部地图参数
         self.use_external_map = rospy.get_param('~use_external_map', False)
         self.external_map_path = rospy.get_param('~external_map_path', '')
+        configured_map_paths = rospy.get_param('~external_map_paths', [])
+        if isinstance(configured_map_paths, str):
+            configured_map_paths = configured_map_paths.replace(';', ',').split(',')
+        elif not isinstance(configured_map_paths, (list, tuple)):
+            raise ValueError("external_map_paths must be a list or comma-separated string")
+        self.external_map_paths = []
+        for map_path in configured_map_paths:
+            map_path = str(map_path).strip()
+            if map_path and map_path not in self.external_map_paths:
+                self.external_map_paths.append(map_path)
+        if not self.external_map_paths and self.external_map_path:
+            self.external_map_paths = [self.external_map_path]
+        if self.external_map_paths:
+            self.external_map_path = self.external_map_paths[0]
+        self.current_external_map_index = None
         self.external_map_format = rospy.get_param('~external_map_format', 'pcd')  # 支持 'pcd', 'ply', 'txt', 'heightmap'
+        self.target_map_size = float(rospy.get_param('~target_map_size', 20.0))
+        self.target_resolution = float(rospy.get_param('~target_resolution', 0.2))
+        self.external_map_fixed_yaw_deg = float(
+            rospy.get_param('~external_map_fixed_yaw_deg', 180.0))
+        self.external_map_physical_size = float(
+            rospy.get_param('~external_map_physical_size', 0.0))
+        self.external_map_min_physical_size = float(
+            rospy.get_param('~external_map_min_physical_size', 0.0))
+        self.scale_external_map_z = bool(
+            rospy.get_param('~scale_external_map_z', False))
+        self.crop_rotation_min_deg = float(
+            rospy.get_param('~crop_rotation_min_deg', -180.0))
+        self.crop_rotation_max_deg = float(
+            rospy.get_param('~crop_rotation_max_deg', 180.0))
+        self.crop_padding = float(rospy.get_param('~crop_padding', 1.0))
+        self.crop_min_points = int(rospy.get_param('~crop_min_points', 50))
+        self.crop_min_coverage = float(
+            rospy.get_param('~crop_min_coverage', 0.85))
+        self.crop_max_attempts = int(rospy.get_param('~crop_max_attempts', 50))
+        self.crop_random_seed = int(rospy.get_param('~crop_random_seed', -1))
+        self.crop_rng = np.random.default_rng(
+            None if self.crop_random_seed < 0 else self.crop_random_seed)
+        self.current_crop_info = None
+        self.current_source_transform = None
+        # 每个worker对每个源地图只读取并规范化一次。后续环境以及地图重生成
+        # 都只执行随机裁剪，避免反复加载点云。
+        self.cached_external_source_maps = {}
+
+        if self.target_map_size <= 0.0 or self.target_resolution <= 0.0:
+            raise ValueError("target_map_size and target_resolution must be positive")
+        target_cells = self.target_map_size / self.target_resolution
+        if not np.isclose(target_cells, round(target_cells), atol=1e-6):
+            raise ValueError(
+                "target_map_size must be an integer multiple of target_resolution")
+        if self.crop_padding < 0.0:
+            raise ValueError("crop_padding must be non-negative")
+        if self.external_map_min_physical_size < 0.0:
+            raise ValueError("external_map_min_physical_size must be non-negative")
+        if not 0.0 <= self.crop_min_coverage <= 1.0:
+            raise ValueError("crop_min_coverage must be in [0, 1]")
+        if self.crop_rotation_max_deg < self.crop_rotation_min_deg:
+            raise ValueError(
+                "crop_rotation_max_deg must be >= crop_rotation_min_deg")
         
         # 验证外部地图配置
         if self.use_external_map:
-            if not self.external_map_path:
-                rospy.logerr("use_external_map is True but external_map_path is empty!")
-                rospy.logerr("Please set the ~external_map_path parameter to a valid file path.")
-                raise ValueError("external_map_path must be specified when use_external_map is True")
-            if not os.path.exists(self.external_map_path):
-                rospy.logerr(f"External map file not found: {self.external_map_path}")
-                raise FileNotFoundError(f"External map file not found: {self.external_map_path}")
+            if not self.external_map_paths:
+                raise ValueError(
+                    "external_map_paths or external_map_path must be specified "
+                    "when use_external_map is True")
+            for map_path in self.external_map_paths:
+                if not os.path.exists(map_path):
+                    raise FileNotFoundError(
+                        f"External map file not found: {map_path}")
         
         # 地形生成参数（仅在不使用外部地图时有效）
         self.map_size = rospy.get_param('~map_size', 10.0)
@@ -1467,7 +1534,7 @@ class TerrainDatasetGenerator:
         self.min_height = rospy.get_param('~min_height', 0.0)
         
         # 地图转换参数（完全匹配grid_transformer.cpp）
-        self.coarse_resolution = rospy.get_param('~coarse_resolution', 0.4)  # 匹配grid_coarse_resolution_
+        self.coarse_resolution = rospy.get_param('~coarse_resolution', 0.2)  # 匹配grid_coarse_resolution_
         self.fine_resolution = rospy.get_param('~fine_resolution', 0.2)      # 匹配grid_desired_resolution_
         self.voxel_size = rospy.get_param('~voxel_size', 0.2)                # 匹配voxelSize
         
@@ -1479,6 +1546,57 @@ class TerrainDatasetGenerator:
         self.map_y_max = self.map_size / 2 - 1.0
         self.min_distance = rospy.get_param('~min_distance', 2.0)
         self.publish_delay = rospy.get_param('~publish_delay', 0.1)
+        self.prefilter_stable_poses = bool(
+            rospy.get_param('~prefilter_stable_poses', True))
+        # 保存前的最终验收严格复用 MPT 当前 stability contract。它与
+        # planner/pose prefilter 的 binary yaw map 分离，避免二者语义混用。
+        self.trajectory_stability_d_safe = float(
+            rospy.get_param('~trajectory_stability_d_safe', 0.15))
+        self.trajectory_stability_yaw_weight = float(
+            rospy.get_param('~trajectory_stability_yaw_weight', 1.4))
+        self.trajectory_stability_yaw_bins = int(
+            rospy.get_param('~trajectory_stability_yaw_bins', 36))
+        if self.trajectory_stability_d_safe < 0.0:
+            raise ValueError("trajectory_stability_d_safe must be non-negative")
+        if self.trajectory_stability_yaw_weight <= 0.0:
+            raise ValueError("trajectory_stability_yaw_weight must be positive")
+        if self.trajectory_stability_yaw_bins <= 1:
+            raise ValueError("trajectory_stability_yaw_bins must be greater than one")
+        self.pose_sampling_max_attempts = int(
+            rospy.get_param('~pose_sampling_max_attempts', 1000))
+        if self.pose_sampling_max_attempts <= 0:
+            raise ValueError("pose_sampling_max_attempts must be positive")
+        self.medium_distance_fraction = float(
+            rospy.get_param('~medium_distance_fraction', 0.4))
+        self.long_distance_fraction = float(
+            rospy.get_param('~long_distance_fraction', 0.4))
+        self.moderate_complexity_fraction = float(
+            rospy.get_param('~moderate_complexity_fraction', 0.4))
+        self.high_complexity_fraction = float(
+            rospy.get_param('~high_complexity_fraction', 0.4))
+        for fraction_name in (
+                'medium_distance_fraction', 'long_distance_fraction',
+                'moderate_complexity_fraction',
+                'high_complexity_fraction'):
+            fraction = getattr(self, fraction_name)
+            if not 0.0 <= fraction <= 1.0:
+                raise ValueError(f"{fraction_name} must be in [0, 1]")
+        if (self.medium_distance_fraction +
+                self.long_distance_fraction > 1.0):
+            raise ValueError(
+                "medium_distance_fraction + long_distance_fraction "
+                "must be <= 1")
+        if (self.moderate_complexity_fraction +
+                self.high_complexity_fraction > 1.0):
+            raise ValueError(
+                "moderate_complexity_fraction + "
+                "high_complexity_fraction must be <= 1")
+        self.map_ready_delay = float(
+            rospy.get_param('~map_ready_delay', 1.0))
+        self.max_path_retries_before_regenerate = int(
+            rospy.get_param('~max_path_retries_before_regenerate', 30))
+        if self.map_ready_delay < 0.0:
+            raise ValueError("map_ready_delay must be non-negative")
         
         # 状态变量
         self.current_env_id = self.start_env_id
@@ -1488,6 +1606,10 @@ class TerrainDatasetGenerator:
         self.waiting_for_result = False
         self.current_trajectory = None
         self.map_update_timeout = rospy.get_param('~map_update_timeout', 10.0)
+        self.planner_connection_timeout = float(
+            rospy.get_param('~planner_connection_timeout', 60.0))
+        if self.planner_connection_timeout <= 0.0:
+            raise ValueError("planner_connection_timeout must be positive")
 
         # 新增：用于轨迹稳定性验证的当前地图缓存
         self.current_normal_x = None
@@ -1497,6 +1619,27 @@ class TerrainDatasetGenerator:
         self.current_resolution = None
         self.current_yaw_scores = None
         self.current_yaw_bins = None
+        self.current_trajectory_stability_esdf = None
+        self.current_stable_pose_candidates = None
+        self.max_pose_distance = None
+        self.current_pose_sampling_profile = None
+
+        # 一个路径只有一个重试管理者；定时器也只能有一个有效实例。
+        self.planning_attempt_id = 0
+        self.active_planning_attempt_id = None
+        self.planning_timeout_timer = None
+        self.next_path_timer = None
+        self.next_path_schedule_id = 0
+        self.path_retry_count = 0
+        self.retry_statistics = {
+            'planning_failed': 0,
+            'trajectory_unstable': 0,
+            'empty_trajectory': 0,
+            'watchdog_timeout': 0,
+            'environment_regenerated': 0,
+        }
+        self.map_update_request_id = 0
+        self.current_planner_map_version = None
 
         # 添加轨迹标识，防止地图切换时的轨迹混乱
         self.expected_env_id = self.start_env_id
@@ -1520,7 +1663,9 @@ class TerrainDatasetGenerator:
             )
         else:
             self.terrain_generator = None
-            rospy.loginfo(f"Using external map from: {self.external_map_path}")
+            rospy.loginfo(
+                "Using %d external source map(s): %s",
+                len(self.external_map_paths), self.external_map_paths)
         
         self.grid_transformer = GridTransformer(
             coarse_resolution=self.coarse_resolution,
@@ -1529,18 +1674,22 @@ class TerrainDatasetGenerator:
         )
         
         # ROS通信
-        self.pointcloud_pub = rospy.Publisher('/uneven_map/pointcloud', PointCloud2, queue_size=1, latch=True)
+        # 全部使用相对ROS名称；单worker时仍解析到原有根话题，多worker时
+        # 自动隔离到各自命名空间。
+        self.pointcloud_pub = rospy.Publisher('uneven_map/pointcloud', PointCloud2, queue_size=1, latch=True)
         # Occupancy map publisher (external occ map to uneven_map)
-        self.occ_pub = rospy.Publisher('/external_occ_map', OccupancyGrid, queue_size=1, latch=True)
+        self.occ_pub = rospy.Publisher('external_occ_map', OccupancyGrid, queue_size=1, latch=True)
         # 3D occupancy grid publisher (HWY layout) for receivers that expect HWY flattened
         from std_msgs.msg import Float32MultiArray
-        self.occ3d_pub = rospy.Publisher('/external_occ_grid_hwy', Float32MultiArray, queue_size=1, latch=True)
-        self.start_pose_pub = rospy.Publisher('/data_generate_node/start_pose', PoseStamped, queue_size=1)
-        self.target_pose_pub = rospy.Publisher('/data_generate_node/target_pose', PoseStamped, queue_size=1)
+        self.occ3d_pub = rospy.Publisher('external_occ_grid_hwy', Float32MultiArray, queue_size=1, latch=True)
+        self.terrain_update_service = rospy.ServiceProxy(
+            'update_terrain_map', UpdateTerrainMap)
+        self.start_pose_pub = rospy.Publisher('data_generate_node/start_pose', PoseStamped, queue_size=1)
+        self.target_pose_pub = rospy.Publisher('data_generate_node/target_pose', PoseStamped, queue_size=1)
         
-        self.traj_sub = rospy.Subscriber('/data_generate_node/optimized_traj', SE2Traj, self.trajectory_callback)
-        self.result_sub = rospy.Subscriber('/data_generate_node/planning_result', Bool, self.planning_result_callback)
-        self.map_regen_sub = rospy.Subscriber('/data_generate_node/map_regeneration_request', Bool, self.map_regeneration_callback)
+        self.traj_sub = rospy.Subscriber('data_generate_node/optimized_traj', SE2Traj, self.trajectory_callback)
+        self.result_sub = rospy.Subscriber('data_generate_node/planning_result', Bool, self.planning_result_callback)
+        self.map_regen_sub = rospy.Subscriber('data_generate_node/map_regeneration_request', Bool, self.map_regeneration_callback)
         
         rospy.loginfo(f"TerrainDatasetGenerator initialized:")
         rospy.loginfo(f"  - num_environments: {self.num_environments}")
@@ -1548,6 +1697,11 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"  - val_paths_per_env: {self.val_paths_per_env}")
         rospy.loginfo(f"  - dataset_dir: {self.dataset_dir}")
         rospy.loginfo(f"  - start_env_id: {self.start_env_id}")
+        if self.use_external_map:
+            rospy.loginfo(
+                f"  - random external crop: {self.target_map_size:.2f}m x "
+                f"{self.target_map_size:.2f}m, {self.target_resolution:.3f}m/cell, "
+                f"{int(round(target_cells))}x{int(round(target_cells))}")
         
         rospy.loginfo("TerrainDatasetGenerator ready to start!")
         
@@ -1583,30 +1737,261 @@ class TerrainDatasetGenerator:
         ros_pointcloud = pc2.create_cloud_xyz32(header, points)
 
         return ros_pointcloud
-    
-    def copy_map_to_val_directory(self):
-        """将地图文件从训练目录复制到验证目录"""
-        env_name = f"env{self.current_env_id:06d}"
-        train_env_dir = os.path.join(self.train_dir, env_name)
-        val_env_dir = os.path.join(self.val_dir, env_name)
-        
-        # 确保验证目录存在
-        os.makedirs(val_env_dir, exist_ok=True)
-        
-        # 需要复制的文件列表
-        files_to_copy = ['map.p', 'terrain_2d.png', 'terrain_3d.png']
-        for file_name in files_to_copy:
-            src_file = os.path.join(train_env_dir, file_name)
-            dst_file = os.path.join(val_env_dir, file_name)
-            
-            if os.path.exists(src_file):
-                try:
-                    shutil.copy2(src_file, dst_file)
-                    rospy.loginfo(f"Copied {file_name} to val directory: {env_name}")
-                except Exception as e:
-                    rospy.logwarn(f"Failed to copy {file_name} to val directory: {e}")
-            else:
-                rospy.logwarn(f"Source file not found: {src_file}")
+
+    def select_external_map_path(self):
+        """为当前环境/split确定性轮换源地图，并让val避开同index的train源。"""
+        source_count = len(self.external_map_paths)
+        source_index = self.current_env_id % source_count
+        if self.current_phase == 'val' and source_count > 1:
+            source_index = (source_index + 1) % source_count
+        self.current_external_map_index = source_index
+        self.external_map_path = self.external_map_paths[source_index]
+        rospy.loginfo(
+            "Selected external source map %d/%d for env%06d (%s): %s",
+            source_index + 1, source_count, self.current_env_id,
+            self.current_phase, self.external_map_path)
+        return self.external_map_path
+
+    def prepare_external_map_frame(self, pcd):
+        """应用外部地图的固定坐标系旋转（默认保持原有的180度变换）。"""
+        points = np.asarray(pcd.points, dtype=np.float64)
+        angle = math.radians(self.external_map_fixed_yaw_deg)
+        cos_angle = math.cos(angle)
+        sin_angle = math.sin(angle)
+        rotated_points = points.copy()
+        rotated_points[:, 0] = cos_angle * points[:, 0] - sin_angle * points[:, 1]
+        rotated_points[:, 1] = sin_angle * points[:, 0] + cos_angle * points[:, 1]
+        pcd.points = o3d.utility.Vector3dVector(rotated_points)
+        return pcd
+
+    def normalize_external_map_scale(self, pcd):
+        """
+        将外部点云的源坐标单位统一转换为米，并将XY中心移到原点。
+
+        external_map_physical_size > 0 时把较长的横向跨度缩放到该尺寸；
+        否则保留米制坐标，但可通过external_map_min_physical_size仅放大过小
+        的源地图。高度默认不跟随XY缩放，只有显式启用scale_external_map_z
+        时才会缩放。
+        """
+        points = np.asarray(pcd.points, dtype=np.float64)
+        finite_mask = np.isfinite(points).all(axis=1)
+        if not np.any(finite_mask):
+            raise ValueError("External map contains no finite points")
+
+        finite_xy = points[finite_mask, :2]
+        raw_min = finite_xy.min(axis=0)
+        raw_max = finite_xy.max(axis=0)
+        raw_center = (raw_min + raw_max) / 2.0
+        raw_extent = raw_max - raw_min
+        max_horizontal_extent = float(np.max(raw_extent))
+        min_horizontal_extent = float(np.min(raw_extent))
+        if max_horizontal_extent <= 0.0:
+            raise ValueError("External map has zero horizontal extent")
+
+        if self.external_map_physical_size > 0.0:
+            scale = self.external_map_physical_size / max_horizontal_extent
+        elif (self.external_map_min_physical_size > 0.0 and
+              min_horizontal_extent < self.external_map_min_physical_size):
+            scale = (
+                self.external_map_min_physical_size / min_horizontal_extent)
+        else:
+            scale = 1.0
+
+        normalized_points = points.copy()
+        normalized_points[:, 0] = (points[:, 0] - raw_center[0]) * scale
+        normalized_points[:, 1] = (points[:, 1] - raw_center[1]) * scale
+        if self.scale_external_map_z:
+            normalized_points[:, 2] = points[:, 2] * scale
+        pcd.points = o3d.utility.Vector3dVector(normalized_points)
+
+        transform_info = {
+            'raw_bounds': (
+                float(raw_min[0]), float(raw_max[0]),
+                float(raw_min[1]), float(raw_max[1])),
+            'raw_center': (float(raw_center[0]), float(raw_center[1])),
+            'raw_horizontal_extent': (
+                float(raw_extent[0]), float(raw_extent[1])),
+            'meters_per_source_unit': float(scale),
+            'physical_size': float(
+                max_horizontal_extent * scale),
+            'scale_z': self.scale_external_map_z
+        }
+        rospy.loginfo(
+            "Normalized external map: raw extent=(%.3f, %.3f), "
+            "scale=%.8f m/source-unit, physical extent=(%.3f, %.3f)m",
+            raw_extent[0], raw_extent[1], scale,
+            raw_extent[0] * scale, raw_extent[1] * scale)
+        finite_z = normalized_points[finite_mask, 2]
+        rospy.loginfo(
+            "External map height range after normalization: [%.3f, %.3f]m "
+            "(scale_z=%s)",
+            float(np.min(finite_z)), float(np.max(finite_z)),
+            self.scale_external_map_z)
+        return pcd, transform_info
+
+    def sample_rotated_external_crop(self, source_pcd):
+        """
+        从外部点云随机选取一个可旋转的正方形区域，并转换到局部地图坐标系。
+
+        返回严格位于目标范围内的点云、仅供栅格转换使用的padding点云，
+        以及裁剪元数据。两份点云中心均位于原点，目标区域在
+        [-target_map_size/2, target_map_size/2) 内。
+        """
+        all_source_points = np.asarray(source_pcd.points, dtype=np.float64)
+        finite_mask = np.isfinite(all_source_points).all(axis=1)
+        all_points_are_finite = bool(np.all(finite_mask))
+        # 常见PCD全部为有限值，此时保留Open3D的零拷贝视图；原先每次
+        # 裁剪都会复制约500万点，既耗时又放大多worker的内存峰值。
+        if all_points_are_finite:
+            source_points = all_source_points
+        else:
+            source_points = all_source_points[finite_mask]
+        if len(source_points) == 0:
+            raise ValueError("External map contains no finite points")
+
+        source_colors = None
+        colors = np.asarray(source_pcd.colors)
+        if len(colors) == len(all_source_points):
+            source_colors = (
+                colors if all_points_are_finite else colors[finite_mask])
+
+        source_min = source_points[:, :2].min(axis=0)
+        source_max = source_points[:, :2].max(axis=0)
+        crop_half_size = self.target_map_size / 2.0
+        selection_half_size = crop_half_size + self.crop_padding
+
+        for attempt in range(1, self.crop_max_attempts + 1):
+            crop_yaw_deg = float(self.crop_rng.uniform(
+                self.crop_rotation_min_deg, self.crop_rotation_max_deg))
+            crop_yaw = math.radians(crop_yaw_deg)
+            cos_yaw = math.cos(crop_yaw)
+            sin_yaw = math.sin(crop_yaw)
+
+            # 旋转正方形在源坐标轴上的半宽。以此约束中心，保证整个
+            # 目标区域（含法向量估计 padding）都落在源地图包围盒内。
+            source_axis_extent = selection_half_size * (
+                abs(cos_yaw) + abs(sin_yaw))
+            center_min = source_min + source_axis_extent
+            center_max = source_max - source_axis_extent
+            if np.any(center_min > center_max):
+                continue
+
+            center = self.crop_rng.uniform(center_min, center_max)
+            delta_x = source_points[:, 0] - center[0]
+            delta_y = source_points[:, 1] - center[1]
+
+            # source -> crop local: R(-yaw) * (point - center)
+            local_x = cos_yaw * delta_x + sin_yaw * delta_y
+            local_y = -sin_yaw * delta_x + cos_yaw * delta_y
+            exact_mask = (
+                (np.abs(local_x) < crop_half_size) &
+                (np.abs(local_y) < crop_half_size))
+            exact_point_count = int(np.count_nonzero(exact_mask))
+            if exact_point_count < self.crop_min_points:
+                continue
+
+            # 用C++聚合所采用的粗栅格分辨率检查空间覆盖率。仅检查点数
+            # 会让扫描线状的稀疏裁剪通过，随后在100x100地图中产生大量NaN。
+            coarse_grid_size = int(math.ceil(
+                self.target_map_size / self.coarse_resolution))
+            exact_x = local_x[exact_mask]
+            exact_y = local_y[exact_mask]
+            coarse_ix = np.floor(
+                (exact_x + crop_half_size) / self.coarse_resolution).astype(int)
+            coarse_iy = np.floor(
+                (exact_y + crop_half_size) / self.coarse_resolution).astype(int)
+            valid_indices = (
+                (coarse_ix >= 0) & (coarse_ix < coarse_grid_size) &
+                (coarse_iy >= 0) & (coarse_iy < coarse_grid_size))
+            occupied_linear = np.unique(
+                coarse_iy[valid_indices] * coarse_grid_size +
+                coarse_ix[valid_indices])
+            coarse_coverage = (
+                len(occupied_linear) / float(coarse_grid_size ** 2))
+            if coarse_coverage < self.crop_min_coverage:
+                continue
+
+            padded_mask = (
+                (np.abs(local_x) < selection_half_size) &
+                (np.abs(local_y) < selection_half_size))
+            cropped_points = source_points[padded_mask].copy()
+            cropped_points[:, 0] = local_x[padded_mask]
+            cropped_points[:, 1] = local_y[padded_mask]
+
+            cropped_pcd = o3d.geometry.PointCloud()
+            cropped_pcd.points = o3d.utility.Vector3dVector(cropped_points)
+            if source_colors is not None:
+                cropped_pcd.colors = o3d.utility.Vector3dVector(
+                    source_colors[padded_mask])
+
+            # 对外发布和保存可视化时必须严格保持20m目标范围；带padding
+            # 的版本只供C++法向量估计使用，不能当成最终裁剪点云。
+            target_points = source_points[exact_mask].copy()
+            target_points[:, 0] = local_x[exact_mask]
+            target_points[:, 1] = local_y[exact_mask]
+            target_pcd = o3d.geometry.PointCloud()
+            target_pcd.points = o3d.utility.Vector3dVector(target_points)
+            if source_colors is not None:
+                target_pcd.colors = o3d.utility.Vector3dVector(
+                    source_colors[exact_mask])
+
+            fixed_yaw = math.radians(self.external_map_fixed_yaw_deg)
+            fixed_cos = math.cos(fixed_yaw)
+            fixed_sin = math.sin(fixed_yaw)
+            center_in_original_frame = (
+                fixed_cos * center[0] + fixed_sin * center[1],
+                -fixed_sin * center[0] + fixed_cos * center[1])
+            raw_center = self.current_source_transform['raw_center']
+            source_scale = self.current_source_transform[
+                'meters_per_source_unit']
+            center_in_raw_source_frame = (
+                center_in_original_frame[0] / source_scale + raw_center[0],
+                center_in_original_frame[1] / source_scale + raw_center[1])
+            yaw_in_original_frame_deg = (
+                crop_yaw_deg - self.external_map_fixed_yaw_deg + 180.0
+            ) % 360.0 - 180.0
+
+            crop_info = {
+                'center_in_source_frame': (float(center[0]), float(center[1])),
+                'center_in_original_frame': (
+                    float(center_in_original_frame[0]),
+                    float(center_in_original_frame[1])),
+                'center_in_raw_source_frame': (
+                    float(center_in_raw_source_frame[0]),
+                    float(center_in_raw_source_frame[1])),
+                'yaw_deg': crop_yaw_deg,
+                'yaw_rad': crop_yaw,
+                'yaw_in_original_frame_deg': yaw_in_original_frame_deg,
+                'fixed_source_yaw_deg': self.external_map_fixed_yaw_deg,
+                'target_map_size': self.target_map_size,
+                'target_resolution': self.target_resolution,
+                'local_bounds': (
+                    -crop_half_size, crop_half_size,
+                    -crop_half_size, crop_half_size),
+                'padding': self.crop_padding,
+                'points_in_target': exact_point_count,
+                'points_with_padding': int(len(cropped_points)),
+                'coarse_coverage': float(coarse_coverage),
+                'sampling_attempt': attempt,
+                'source_transform': dict(self.current_source_transform),
+                'source_bounds': (
+                    float(source_min[0]), float(source_max[0]),
+                    float(source_min[1]), float(source_max[1]))
+            }
+            rospy.loginfo(
+                "Selected external crop: center=(%.3f, %.3f), yaw=%.2fdeg, "
+                "points=%d (+padding: %d), coarse coverage=%.1f%%, attempt=%d",
+                center[0], center[1], crop_yaw_deg, exact_point_count,
+                len(cropped_points), coarse_coverage * 100.0, attempt)
+            return target_pcd, cropped_pcd, crop_info
+
+        raise RuntimeError(
+            "Unable to sample a valid rotated external-map crop after "
+            f"{self.crop_max_attempts} attempts. Source bounds are "
+            f"x[{source_min[0]:.3f}, {source_max[0]:.3f}], "
+            f"y[{source_min[1]:.3f}, {source_max[1]:.3f}]. "
+            "Check external_map_physical_size, or reduce crop_padding/"
+            "crop_min_points/crop_min_coverage.")
     
     def generate_new_environment(self):
         """生成新的地形环境"""
@@ -1634,26 +2019,38 @@ class TerrainDatasetGenerator:
         
         # 生成或加载地形
         if self.use_external_map:
-            # 使用外部地图
-            rospy.loginfo("Loading external map...")
-            pcd = self.load_external_map()
-            # 对pcd进行180度旋转
-            R = np.array([[-1, 0, 0],
-                          [0, -1, 0],
-                          [0, 0, 1]])
-            pcd.points = o3d.utility.Vector3dVector(np.asarray(pcd.points).dot(R.T))
+            selected_map_path = self.select_external_map_path()
+            cache_entry = self.cached_external_source_maps.get(
+                selected_map_path)
+            if cache_entry is None:
+                rospy.loginfo("Loading and caching external source map...")
+                source_pcd = self.load_external_map()
+                source_pcd, source_transform = (
+                    self.normalize_external_map_scale(source_pcd))
+                source_pcd = self.prepare_external_map_frame(source_pcd)
+                cache_entry = (source_pcd, source_transform)
+                self.cached_external_source_maps[selected_map_path] = cache_entry
+            else:
+                rospy.loginfo(
+                    "Reusing cached external source map: %s",
+                    selected_map_path)
+            source_pcd, self.current_source_transform = cache_entry
+            pcd, grid_input_pcd, self.current_crop_info = (
+                self.sample_rotated_external_crop(source_pcd))
 
             # 为外部地图创建基本的terrain_info
             points = np.asarray(pcd.points)
             terrain_info = {
-                'map_size': self.map_size,
-                'resolution': self.map_resolution,
+                'map_size': self.target_map_size,
+                'resolution': self.target_resolution,
                 'max_height': np.max(points[:, 2]) if len(points) > 0 else self.max_height,
                 'min_height': np.min(points[:, 2]) if len(points) > 0 else self.min_height,
                 'num_points': len(points),
                 'source': 'external_map',
                 'external_map_path': self.external_map_path,
-                'external_map_format': self.external_map_format
+                'external_map_index': self.current_external_map_index,
+                'external_map_format': self.external_map_format,
+                'crop': dict(self.current_crop_info)
             }
             
             # 对于外部地图，不需要heightmap，设置为None
@@ -1668,83 +2065,36 @@ class TerrainDatasetGenerator:
         
         # 转换为栅格地图
         if self.use_external_map:
-            # 对于外部地图，计算实际点云边界
-            points = np.asarray(pcd.points)
-            
-            # 获取点云的实际范围
-            x_min, y_min = points[:, 0].min(), points[:, 1].min()
-            x_max, y_max = points[:, 0].max(), points[:, 1].max()
-            
-            # 计算实际地图尺寸（保持正方形）
-            actual_x_range = x_max - x_min
-            actual_y_range = y_max - y_min
-            actual_map_size = max(actual_x_range, actual_y_range)
-            
-            # 计算地图中心
-            x_center = (x_min + x_max) / 2.0
-            y_center = (y_min + y_max) / 2.0
-            
-            # 使用实际地图尺寸计算bounds
-            half_size = actual_map_size / 2.0
-            map_bounds = (x_center - half_size, x_center + half_size, 
-                         y_center - half_size, y_center + half_size)
-            
-            rospy.loginfo(f"External map actual bounds: x[{map_bounds[0]:.2f}, {map_bounds[1]:.2f}], "
-                         f"y[{map_bounds[2]:.2f}, {map_bounds[3]:.2f}], size={actual_map_size:.2f}m")
-            
-            # C++服务将使用0.2m分辨率生成完整的fine grid (例如41.2m -> 206x206)
-            grid_map_data = self.grid_transformer.transform_pointcloud_to_grid(pcd, map_bounds)
-            
-            # 获取C++生成的grid尺寸
+            # 点云已经被旋转、裁剪并移到局部坐标系。只对20m目标区域
+            # 栅格化，避免先处理整张大地图再做固定中心裁剪。
+            half_size = self.target_map_size / 2.0
+            map_bounds = (-half_size, half_size, -half_size, half_size)
+            grid_map_data = self.grid_transformer.transform_pointcloud_to_grid(
+                grid_input_pcd, map_bounds)
+
+            # 不再通过 resize 隐式改变物理分辨率；服务必须直接输出100x100。
+            expected_grid_size = int(round(
+                self.target_map_size / self.target_resolution))
             actual_grid_shape = grid_map_data['elevation'].shape
-            rospy.loginfo(f"C++ service generated grid shape: {actual_grid_shape}")
-            
-            # 计算目标尺寸（用于最终输出）
-            target_map_size = rospy.get_param('~target_map_size', self.map_size)  # 默认40m
-            target_resolution = rospy.get_param('~target_resolution', 0.4)  # 默认0.4m
-            target_grid_size = int(target_map_size / target_resolution)  # 例如 40/0.4 = 100
-            
-            rospy.loginfo(f"Target output: size={target_map_size}m, resolution={target_resolution}m, grid={target_grid_size}x{target_grid_size}")
-            
-            # 先裁剪到200x200 (对应40m，0.2m分辨率)
-            crop_size = int(target_map_size / 0.2)  # 40m / 0.2m = 200
-            
-            if actual_grid_shape[0] >= crop_size and actual_grid_shape[1] >= crop_size:
-                # 中心裁剪到200x200
-                current_h, current_w = actual_grid_shape
-                start_h = (current_h - crop_size) // 2
-                end_h = start_h + crop_size
-                start_w = (current_w - crop_size) // 2
-                end_w = start_w + crop_size
-                
-                rospy.loginfo(f"Cropping {actual_grid_shape} to center {crop_size}x{crop_size} region: H[{start_h}:{end_h}], W[{start_w}:{end_w}]")
-                
-                grid_map_data['elevation'] = grid_map_data['elevation'][start_h:end_h, start_w:end_w]
-                grid_map_data['normal_x'] = grid_map_data['normal_x'][start_h:end_h, start_w:end_w]
-                grid_map_data['normal_y'] = grid_map_data['normal_y'][start_h:end_h, start_w:end_w]
-                grid_map_data['normal_z'] = grid_map_data['normal_z'][start_h:end_h, start_w:end_w]
-                
-                rospy.loginfo(f"After cropping: {grid_map_data['elevation'].shape}")
-            else:
-                rospy.logwarn(f"Grid size {actual_grid_shape} is smaller than crop size {crop_size}x{crop_size}, skipping crop")
-            
-            # Resize到最终目标尺寸 (例如从200x200 resize到100x100)
-            current_shape = grid_map_data['elevation'].shape
-            if current_shape != (target_grid_size, target_grid_size):
-                rospy.loginfo(f"Resizing from {current_shape} to ({target_grid_size}, {target_grid_size})")
-                
-                grid_map_data['elevation'] = self.grid_transformer.resize_map(grid_map_data['elevation'], target_grid_size)
-                grid_map_data['normal_x'] = self.grid_transformer.resize_map(grid_map_data['normal_x'], target_grid_size)
-                grid_map_data['normal_y'] = self.grid_transformer.resize_map(grid_map_data['normal_y'], target_grid_size)
-                grid_map_data['normal_z'] = self.grid_transformer.resize_map(grid_map_data['normal_z'], target_grid_size)
-                
-                rospy.loginfo(f"Final grid shape after resize: {grid_map_data['elevation'].shape}")
-            
+            actual_resolution = float(grid_map_data['resolution'])
+            if actual_grid_shape != (expected_grid_size, expected_grid_size):
+                raise RuntimeError(
+                    f"Grid converter returned {actual_grid_shape}, expected "
+                    f"({expected_grid_size}, {expected_grid_size})")
+            if not math.isclose(
+                    actual_resolution, self.target_resolution,
+                    rel_tol=0.0, abs_tol=1e-6):
+                raise RuntimeError(
+                    f"Grid converter returned resolution {actual_resolution}, "
+                    f"expected {self.target_resolution}. Check "
+                    "grid_fine_resolution in the launch file.")
+
             # 验证处理结果
-            self.validate_external_map_processing(grid_map_data, target_map_size, target_resolution)
+            self.validate_external_map_processing(
+                grid_map_data, self.target_map_size, self.target_resolution)
             
             # 更新位姿生成范围以匹配外部地图尺寸
-            self.update_pose_generation_bounds(target_map_size)
+            self.update_pose_generation_bounds(self.target_map_size)
         else:
             # 对于生成的地形，使用原来的逻辑
             map_bounds = (-self.map_size/2, self.map_size/2, -self.map_size/2, self.map_size/2)
@@ -1793,6 +2143,45 @@ class TerrainDatasetGenerator:
             except Exception as e:
                 rospy.logwarn(f"Failed to compute yaw stability map: {e}")
                 self.current_yaw_scores = None
+
+            # Final save admission uses a separate map with MPT's frozen yaw
+            # discretization and continuous signed-distance semantics. Keep the
+            # planner/pose prefilter above unchanged and binary.
+            try:
+                validation_scores = compute_map_yaw_bins(
+                    self.current_normal_x,
+                    self.current_normal_y,
+                    self.current_normal_z,
+                    self.trajectory_stability_yaw_bins)
+                if isinstance(validation_scores, torch.Tensor):
+                    validation_scores = (
+                        validation_scores.detach().cpu().numpy())
+                validation_scores = np.asarray(validation_scores)
+                expected_shape = (
+                    self.current_normal_x.shape[0],
+                    self.current_normal_x.shape[1],
+                    self.trajectory_stability_yaw_bins,
+                )
+                if validation_scores.shape != expected_shape:
+                    raise ValueError(
+                        "MPT validation yaw map shape mismatch: "
+                        f"{validation_scores.shape} != {expected_shape}")
+                self.current_trajectory_stability_esdf = (
+                    build_periodic_signed_stability_esdf(
+                        validation_scores,
+                        voxel_size_xy=self.current_resolution,
+                        yaw_weight=self.trajectory_stability_yaw_weight,
+                    ))
+                rospy.loginfo(
+                    "Prepared MPT trajectory stability ESDF %s "
+                    "(d_safe=%.3fm, yaw_weight=%.3f)",
+                    self.current_trajectory_stability_esdf.shape,
+                    self.trajectory_stability_d_safe,
+                    self.trajectory_stability_yaw_weight)
+            except Exception as e:
+                rospy.logwarn(
+                    f"Failed to build MPT trajectory stability ESDF: {e}")
+                self.current_trajectory_stability_esdf = None
         except Exception as e:
             rospy.logwarn(f"Failed to cache map normals for trajectory validation: {e}")
             self.current_normal_x = self.current_normal_y = self.current_normal_z = None
@@ -1800,6 +2189,8 @@ class TerrainDatasetGenerator:
             self.current_resolution = None
             self.current_yaw_scores = None
             self.current_yaw_bins = None
+            self.current_trajectory_stability_esdf = None
+        self.prepare_stable_pose_candidates()
 
         # Ensure grid_map_tensor is defined: build from elevation + normals, with fallbacks
         try:
@@ -1862,22 +2253,28 @@ class TerrainDatasetGenerator:
         # 保存地图数据，按照正确的格式
         if self.use_external_map:
             # 对于外部地图，确保使用目标参数
-            target_map_size = rospy.get_param('~target_map_size', self.map_size)
-            target_resolution = rospy.get_param('~target_resolution', 0.4)
-            target_bounds = (-target_map_size/2, target_map_size/2, -target_map_size/2, target_map_size/2)
+            target_bounds = (
+                -self.target_map_size / 2.0, self.target_map_size / 2.0,
+                -self.target_map_size / 2.0, self.target_map_size / 2.0)
             
             map_data = {
                 'tensor': grid_map_tensor,
-                'bounds': target_bounds,  # 强制使用目标边界
-                'resolution': target_resolution,  # 强制使用目标分辨率
+                'bounds': target_bounds,
+                'resolution': self.target_resolution,
                 'map_name': env_name,
                 'channels': ['elevation', 'normal_x', 'normal_y', 'normal_z'],
                 'shape': grid_map_tensor.shape,
                 'source': 'external_map',
+                'dataset_phase': self.current_phase,
                 'original_map_path': self.external_map_path,
+                'original_map_index': self.current_external_map_index,
+                'crop': dict(self.current_crop_info),
                 'target_grid_size': f"{grid_map_tensor.shape[0]}x{grid_map_tensor.shape[1]}"
             }
-            rospy.loginfo(f"External map: saved with target bounds {target_bounds}, resolution {target_resolution}, grid shape {grid_map_tensor.shape}")
+            rospy.loginfo(
+                f"External map: saved with target bounds {target_bounds}, "
+                f"resolution {self.target_resolution}, "
+                f"grid shape {grid_map_tensor.shape}")
         else:
             # 对于生成的地形，使用原来的逻辑
             map_data = {
@@ -1889,33 +2286,80 @@ class TerrainDatasetGenerator:
                 'shape': grid_map_tensor.shape
             }
         
+        # Build the exact HWY map consumed by the embedded UnevenMap. The
+        # update service is the authoritative synchronization barrier: terrain
+        # reconstruction and occupancy replacement both finish before it
+        # returns, so no pose can be sent against an old or mixed map.
+        try:
+            occ_msg, occ_hwy_msg = self.create_occupancy_grid(grid_map_data)
+        except Exception as e:
+            rospy.logfatal(f"Failed to build planner occupancy grid: {e}")
+            rospy.signal_shutdown("invalid planner occupancy grid")
+            raise
+
+        planner_pcd = grid_input_pcd if self.use_external_map else pcd
+        ros_pointcloud = self.pointcloud_to_ros_message(planner_pcd)
+        bounds = grid_map_data.get('bounds')
+        resolution = float(grid_map_data.get('resolution'))
+        if bounds is None or len(bounds) != 4:
+            raise RuntimeError(
+                f"Planner map bounds must be (min_x,max_x,min_y,max_y), "
+                f"got {bounds}")
+        self.map_update_request_id += 1
+        update_request = UpdateTerrainMapRequest()
+        update_request.request_id = self.map_update_request_id
+        update_request.environment_id = self.current_env_id
+        update_request.pointcloud = ros_pointcloud
+        update_request.occupancy_hwy = occ_hwy_msg
+        update_request.min_x = float(bounds[0])
+        update_request.max_x = float(bounds[1])
+        update_request.min_y = float(bounds[2])
+        update_request.max_y = float(bounds[3])
+        update_request.resolution = resolution
+        try:
+            update_response = self.terrain_update_service(update_request)
+        except rospy.ServiceException as exc:
+            rospy.logfatal(f"Atomic planner map update call failed: {exc}")
+            rospy.signal_shutdown("planner map update service failed")
+            raise RuntimeError("planner map update service failed") from exc
+        if (not update_response.success or
+                update_response.request_id != self.map_update_request_id or
+                update_response.environment_id != self.current_env_id):
+            raise RuntimeError(
+                "Planner rejected or mis-correlated map update: "
+                f"success={update_response.success}, "
+                f"request={update_response.request_id}, "
+                f"env={update_response.environment_id}, "
+                f"message={update_response.message}")
+        self.current_planner_map_version = int(update_response.map_version)
+        map_data['planner_map_version'] = self.current_planner_map_version
+        map_data['planner_map_request_id'] = self.map_update_request_id
+        map_data['planner_point_count'] = int(update_response.point_count)
+        rospy.loginfo(
+            "Planner atomically applied %s: version=%d, points=%d, "
+            "occupied_se2=%d, occupied_xy=%d, yaw=%d->%d",
+            env_name, self.current_planner_map_version,
+            update_response.point_count,
+            update_response.occupied_voxel_count,
+            update_response.occupied_xy_count,
+            update_response.source_yaw_bins,
+            update_response.internal_yaw_bins)
+
         map_file = os.path.join(env_dir, 'map.p')
         with open(map_file, 'wb') as f:
             pickle.dump(map_data, f)
-        
         rospy.loginfo(f"Saved map data: {map_file}")
-        # Create and publish occupancy map for uneven_map to consume
-        try:
-            occ_msg = self.create_occupancy_grid(grid_map_data)
-            # if occ_msg is not None:
-            #     # Wait briefly for uneven_map to subscribe, avoid occ callback accessing uninitialized buffers
-            #     wait_start = rospy.Time.now()
-            #     wait_timeout = rospy.Duration(5.0)  # adjust as needed
-            #     while self.occ_pub.get_num_connections() == 0 and (rospy.Time.now() - wait_start) < wait_timeout:
-            #         rospy.sleep(0.05)
-            #     if self.occ_pub.get_num_connections() == 0:
-            #         rospy.logwarn("No subscribers for /external_occ_map after waiting, publishing anyway")
-            #     # self.occ_pub.publish(occ_msg)
-            #     rospy.loginfo(f"Published occupancy grid for {env_name} to /external_occ_map (subscribers={self.occ_pub.get_num_connections()})")
-        except Exception as e:
-            rospy.logwarn(f"Failed to create/publish occupancy grid: {e}")
         
         # 保存地形可视化
-        self.save_terrain_visualizations(heightmap, terrain_info, env_dir)
+        self.save_terrain_visualizations(
+            heightmap, terrain_info, env_dir, pointcloud=pcd,
+            grid_map_data=grid_map_data)
         
-        # 发布点云到ROS
-        ros_pointcloud = self.pointcloud_to_ros_message(pcd)
+        # These latched topics are diagnostics/backward compatibility only.
+        # Planning synchronization is exclusively the service response above.
         self.pointcloud_pub.publish(ros_pointcloud)
+        self.occ3d_pub.publish(occ_hwy_msg)
+        self.occ_pub.publish(occ_msg)
         
         rospy.loginfo(f"Published terrain point cloud for {env_name}")
         rospy.loginfo(f"Map bounds: {grid_map_data.get('bounds', 'Unknown')}")
@@ -1926,17 +2370,17 @@ class TerrainDatasetGenerator:
         self.map_generation_timestamp = rospy.Time.now().to_sec()
         
         # 清理任何待处理的轨迹回调状态，防止旧地图的轨迹被保存到新地图
-        self.waiting_for_result = False
+        self.finish_active_planning_attempt()
+        self.cancel_timer('next_path_timer')
         self.current_trajectory = None
+        self.path_retry_count = 0
         
         # 更新期望的环境和路径ID
         self.expected_env_id = self.current_env_id
         self.expected_path_id = 0
         
-        # 等待地图更新 - 为外部地图增加更多等待时间
-        wait_time = 8.0 if self.use_external_map else 3.0
-        rospy.loginfo(f"Waiting {wait_time}s for map system to process new terrain...")
-        rospy.sleep(wait_time)
+        # 不在这里进行固定阻塞等待。调用方会使用单个可配置的短定时器；
+        # 若地图确实尚未就绪，规划器会立即返回失败并由统一重试逻辑处理。
         
         # 重置路径计数
         self.current_path_id = 0
@@ -1944,7 +2388,9 @@ class TerrainDatasetGenerator:
         
         return env_dir
     
-    def save_terrain_visualizations(self, heightmap, terrain_info, env_dir):
+    def save_terrain_visualizations(
+            self, heightmap, terrain_info, env_dir, pointcloud=None,
+            grid_map_data=None):
         """保存地形可视化图片"""
         import matplotlib
         matplotlib.use('Agg')  # 使用非交互式后端
@@ -1968,18 +2414,38 @@ class TerrainDatasetGenerator:
                 plt.close(fig)
                 plt.clf()
             else:
-                # 对于外部地图，创建说明图
+                # 外部地图直接显示最终写入map.p的100x100高程栅格。这样
+                # 图片与规划器/训练实际使用的数据一致，不会被点云抽样纹理误导。
+                crop_info = terrain_info.get('crop', {})
+                elevation = None
+                if grid_map_data is not None:
+                    elevation = grid_map_data.get('elevation')
+                if elevation is None:
+                    raise ValueError(
+                        "External-map elevation grid is unavailable")
+                elevation = np.asarray(elevation, dtype=np.float32)
+                bounds = grid_map_data.get(
+                    'bounds',
+                    (-self.target_map_size / 2.0,
+                     self.target_map_size / 2.0,
+                     -self.target_map_size / 2.0,
+                     self.target_map_size / 2.0))
+
                 fig, ax = plt.subplots(figsize=(10, 8))
-                ax.text(0.5, 0.5, f'External Map Used\n\nSource: {terrain_info.get("external_map_path", "Unknown")}\n'
-                                  f'Format: {terrain_info.get("external_map_format", "Unknown")}\n'
-                                  f'Points: {terrain_info.get("num_points", "Unknown")}\n'
-                                  f'Height Range: {terrain_info.get("min_height", "N/A"):.2f} - {terrain_info.get("max_height", "N/A"):.2f} m',
-                        transform=ax.transAxes, fontsize=14, ha='center', va='center',
-                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-                ax.set_xlim(0, 1)
-                ax.set_ylim(0, 1)
-                ax.set_title('External Map Information')
-                ax.axis('off')
+                im = ax.imshow(
+                    elevation, origin='lower',
+                    extent=[bounds[0], bounds[1], bounds[2], bounds[3]],
+                    cmap='terrain', interpolation='nearest',
+                    aspect='equal')
+                plt.colorbar(im, ax=ax, label='Height (m)')
+                ax.set_xlabel('Local X (m)')
+                ax.set_ylabel('Local Y (m)')
+                ax.set_title(
+                    'External Map Crop: saved 100x100 elevation grid\n'
+                    f'raw source center='
+                    f'{crop_info.get("center_in_raw_source_frame", "N/A")}, '
+                    f'raw source yaw='
+                    f'{crop_info.get("yaw_in_original_frame_deg", float("nan")):.2f} deg')
                 plt.tight_layout()
                 plt.savefig(os.path.join(env_dir, 'terrain_2d.png'), dpi=150, bbox_inches='tight')
                 plt.close(fig)
@@ -2009,30 +2475,43 @@ class TerrainDatasetGenerator:
                 ax.set_zlabel('Height (m)')
                 ax.set_title(f'3D Terrain View\n(Seed: {terrain_info.get("rng_seed", "N/A")})')
             else:
-                # 对于外部地图，尝试从点云创建3D可视化
-                # 注意：这可能对大型点云很慢，所以我们进行采样
+                # 外部地图绘制最终保存的规则栅格，而不是随机抽样原始点云。
                 try:
-                    # 这里需要访问刚加载的外部点云数据
-                    # 我们需要重新加载或者传递点云数据
-                    pcd = self.load_external_map()
-                    points = np.asarray(pcd.points)
-                    
-                    # 采样以减少绘制时间
-                    if len(points) > 10000:
-                        indices = np.random.choice(len(points), 10000, replace=False)
-                        points = points[indices]
+                    if grid_map_data is None:
+                        raise ValueError("Grid map is unavailable")
+                    elevation = np.asarray(
+                        grid_map_data.get('elevation'), dtype=np.float32)
+                    if elevation.ndim != 2:
+                        raise ValueError(
+                            f"Invalid elevation shape: {elevation.shape}")
+                    bounds = grid_map_data.get(
+                        'bounds',
+                        (-self.target_map_size / 2.0,
+                         self.target_map_size / 2.0,
+                         -self.target_map_size / 2.0,
+                         self.target_map_size / 2.0))
+                    resolution = float(grid_map_data.get(
+                        'resolution', self.target_resolution))
+                    rows, cols = elevation.shape
+                    x = bounds[0] + (
+                        np.arange(cols, dtype=np.float64) + 0.5) * resolution
+                    y = bounds[2] + (
+                        np.arange(rows, dtype=np.float64) + 0.5) * resolution
+                    X, Y = np.meshgrid(x, y)
                     
                     fig = plt.figure(figsize=(12, 8))
                     ax = fig.add_subplot(111, projection='3d')
-                    
-                    scatter = ax.scatter(points[:, 0], points[:, 1], points[:, 2], 
-                                       c=points[:, 2], cmap='terrain', s=1, alpha=0.6)
-                    
+                    surf = ax.plot_surface(
+                        X, Y, elevation, cmap='terrain',
+                        linewidth=0, antialiased=True, alpha=0.9)
+                    ax.set_xlim(bounds[0], bounds[1])
+                    ax.set_ylim(bounds[2], bounds[3])
                     ax.set_xlabel('X (m)')
                     ax.set_ylabel('Y (m)')
                     ax.set_zlabel('Height (m)')
-                    ax.set_title('3D External Map View')
-                    plt.colorbar(scatter, ax=ax, label='Height (m)')
+                    ax.set_title(
+                        '3D External Map Crop (saved 100x100 grid)')
+                    plt.colorbar(surf, ax=ax, label='Height (m)')
                     
                 except Exception as e:
                     rospy.logwarn(f"Failed to create 3D visualization for external map: {e}")
@@ -2077,6 +2556,7 @@ class TerrainDatasetGenerator:
         effective_width = self.map_x_max - self.map_x_min
         effective_height = self.map_y_max - self.map_y_min
         max_possible_distance = math.sqrt(effective_width**2 + effective_height**2)
+        self.max_pose_distance = max_possible_distance
         
         # 动态调整最小距离
         if self.use_external_map:
@@ -2094,6 +2574,77 @@ class TerrainDatasetGenerator:
         x = random.uniform(self.map_x_min, self.map_x_max)
         y = random.uniform(self.map_y_min, self.map_y_max)
         yaw = random.uniform(-np.pi, np.pi)
+        return (x, y, yaw)
+
+    def prepare_stable_pose_candidates(self):
+        """
+        从当前稳定性图中预计算可用端点。
+
+        只保留XY可通行区域中最大的连通分量，并且每个候选姿态对应的
+        yaw bin 都必须稳定。这个检查与最终轨迹验证使用同一份 yaw_scores，
+        因此不会放宽数据要求，只会在调用昂贵规划器前拒绝明显无效的端点。
+        """
+        self.current_stable_pose_candidates = None
+        if (not self.prefilter_stable_poses or
+                self.current_yaw_scores is None or
+                self.current_map_bounds is None or
+                self.current_resolution is None):
+            return
+
+        scores = np.asarray(self.current_yaw_scores)
+        if scores.ndim != 3:
+            rospy.logwarn("Cannot prefilter poses: yaw stability map is not 3-D")
+            return
+
+        stable = np.isfinite(scores) & (scores > 0.5)
+        height, width, _ = stable.shape
+        min_x, _, min_y, _ = self.current_map_bounds
+        resolution = float(self.current_resolution)
+        x_centers = min_x + (np.arange(width) + 0.5) * resolution
+        y_centers = min_y + (np.arange(height) + 0.5) * resolution
+        inside_x = ((x_centers >= self.map_x_min) &
+                    (x_centers <= self.map_x_max))
+        inside_y = ((y_centers >= self.map_y_min) &
+                    (y_centers <= self.map_y_max))
+        allowed_xy = inside_y[:, None] & inside_x[None, :]
+        traversable = np.any(stable, axis=2) & allowed_xy
+
+        labels, component_count = connected_component_label(
+            traversable, structure=np.ones((3, 3), dtype=np.uint8))
+        if component_count == 0:
+            rospy.logwarn("Stable-pose prefilter found no traversable component")
+            return
+
+        component_sizes = np.bincount(labels.ravel())
+        component_sizes[0] = 0
+        largest_label = int(np.argmax(component_sizes))
+        largest_xy = labels == largest_label
+        candidates = np.argwhere(stable & largest_xy[:, :, None])
+        if len(candidates) < 2:
+            rospy.logwarn("Stable-pose prefilter found fewer than two candidates")
+            return
+
+        self.current_stable_pose_candidates = candidates.astype(
+            np.int32, copy=False)
+        rospy.loginfo(
+            "Stable-pose prefilter prepared %d poses in largest component "
+            "(%d/%d traversable cells)",
+            len(candidates), int(component_sizes[largest_label]),
+            int(np.count_nonzero(traversable)))
+
+    def pose_from_stable_candidate(self, candidate):
+        """把 (iy, ix, yaw_bin) 候选项转换为栅格内部的连续位姿。"""
+        iy, ix, yaw_index = (int(candidate[0]), int(candidate[1]),
+                             int(candidate[2]))
+        min_x, _, min_y, _ = self.current_map_bounds
+        resolution = float(self.current_resolution)
+        # 在同一个栅格内部抖动，增加数据多样性且不改变稳定性索引。
+        x = min_x + (ix + random.uniform(0.05, 0.95)) * resolution
+        y = min_y + (iy + random.uniform(0.05, 0.95)) * resolution
+        yaw_bins = self.current_yaw_scores.shape[2]
+        bin_width = 2.0 * math.pi / float(yaw_bins)
+        yaw = (-math.pi + (yaw_index + 0.5) * bin_width +
+               random.uniform(-0.45, 0.45) * bin_width)
         return (x, y, yaw)
     
     def create_pose_stamped(self, x, y, yaw):
@@ -2114,24 +2665,240 @@ class TerrainDatasetGenerator:
         
         return pose
     
+    def pose_sampling_profile_for_current_path(self):
+        """
+        为当前路径确定固定的距离和朝向难度档位。
+
+        档位由环境、阶段和path id确定，因此规划失败后的重试不会从长/难
+        轨迹退化成短/简单轨迹。两个互质排列让距离与难度档位彼此解耦。
+        """
+        phase_offset = 17 if self.current_phase == 'val' else 0
+        distance_slot = (
+            self.current_path_id * 37 +
+            self.current_env_id * 13 + phase_offset) % 100 / 100.0
+        complexity_slot = (
+            self.current_path_id * 53 +
+            self.current_env_id * 29 + phase_offset) % 100 / 100.0
+
+        if distance_slot < self.long_distance_fraction:
+            distance_class = 'long'
+        elif distance_slot < (
+                self.long_distance_fraction +
+                self.medium_distance_fraction):
+            distance_class = 'medium'
+        else:
+            distance_class = 'short'
+
+        if complexity_slot < self.high_complexity_fraction:
+            complexity_class = 'high'
+        elif complexity_slot < (
+                self.high_complexity_fraction +
+                self.moderate_complexity_fraction):
+            complexity_class = 'moderate'
+        else:
+            complexity_class = 'simple'
+
+        max_distance = float(self.max_pose_distance)
+        distance_ratio_ranges = {
+            'short': (0.30, 0.50),
+            'medium': (0.50, 0.70),
+            'long': (0.70, 0.94),
+        }
+        ratio_min, ratio_max = distance_ratio_ranges[distance_class]
+        distance_min = max(self.min_distance, ratio_min * max_distance)
+        distance_max = ratio_max * max_distance
+
+        # 两端朝向相对起点->终点连线的误差之和。实测该指标与轨迹
+        # 曲折率的相关系数约0.86，因而可在调用昂贵规划器前控制复杂度。
+        complexity_ranges = {
+            'simple': (0.0, 2.0),
+            'moderate': (2.0, 4.0),
+            'high': (4.0, 2.0 * math.pi + 1e-6),
+        }
+        mismatch_min, mismatch_max = complexity_ranges[complexity_class]
+        return {
+            'distance_class': distance_class,
+            'complexity_class': complexity_class,
+            'target_distance_range': (distance_min, distance_max),
+            'target_heading_mismatch_range_rad': (
+                mismatch_min, mismatch_max),
+        }
+
+    @staticmethod
+    def pose_pair_sampling_metrics(start, target):
+        """计算端点直线距离和两端相对直连方向的朝向误差之和。"""
+        delta_x = target[0] - start[0]
+        delta_y = target[1] - start[1]
+        distance = math.hypot(delta_x, delta_y)
+        bearing = math.atan2(delta_y, delta_x)
+
+        def angular_error(angle):
+            return abs(math.atan2(
+                math.sin(angle - bearing), math.cos(angle - bearing)))
+
+        mismatch_sum = angular_error(start[2]) + angular_error(target[2])
+        return distance, mismatch_sum
+
+    @staticmethod
+    def interval_penalty(value, lower, upper):
+        """数值落在闭区间内返回0，否则返回到最近边界的距离。"""
+        if value < lower:
+            return lower - value
+        if value > upper:
+            return value - upper
+        return 0.0
+
     def generate_pose_pair(self):
-        """生成起始点和目标点位姿对"""
-        max_attempts = 50
-        
-        for attempt in range(max_attempts):
-            start_x, start_y, start_yaw = self.generate_random_pose()
-            target_x, target_y, target_yaw = self.generate_random_pose()
-            
-            distance = math.sqrt((target_x - start_x)**2 + (target_y - start_y)**2)
-            
-            if distance >= self.min_distance:
-                return (start_x, start_y, start_yaw), (target_x, target_y, target_yaw)
-        
-        # 默认安全位姿对，使用当前地图边界内的相对坐标
-        rospy.logwarn("Failed to generate valid pose pair, using default safe poses")
-        safe_offset = min(abs(self.map_x_min), abs(self.map_x_max), abs(self.map_y_min), abs(self.map_y_max)) * 0.5
-        return (self.map_x_min + safe_offset, self.map_y_min + safe_offset, 0.0), \
-               (self.map_x_max - safe_offset, self.map_y_max - safe_offset, 0.0)
+        """
+        按固定配额生成距离、朝向难度均满足要求的稳定端点对。
+
+        默认比例为20%短/40%中/40%长和20%简单/40%中等/40%高难。
+        这里只增加低成本端点筛选，后续规划和逐点稳定性验证保持严格。
+        """
+        candidates = self.current_stable_pose_candidates
+        profile = self.pose_sampling_profile_for_current_path()
+        distance_min, distance_max = profile['target_distance_range']
+        mismatch_min, mismatch_max = profile[
+            'target_heading_mismatch_range_rad']
+        best_pair = None
+        best_penalty = float('inf')
+
+        for attempt in range(1, self.pose_sampling_max_attempts + 1):
+            if candidates is not None:
+                indices = np.random.randint(0, len(candidates), size=2)
+                start = self.pose_from_stable_candidate(candidates[indices[0]])
+                target = self.pose_from_stable_candidate(
+                    candidates[indices[1]])
+            else:
+                start = self.generate_random_pose()
+                target = self.generate_random_pose()
+
+            distance, mismatch_sum = self.pose_pair_sampling_metrics(
+                start, target)
+            distance_penalty = self.interval_penalty(
+                distance, distance_min, distance_max)
+            mismatch_penalty = self.interval_penalty(
+                mismatch_sum, mismatch_min, mismatch_max)
+            # 归一化后记录最接近目标档位的稳定端点对，作为极少数采样
+            # 不收敛时的保底；不会回退到固定的中短距离位姿。
+            penalty = (
+                distance_penalty / max(self.max_pose_distance, 1e-6) +
+                mismatch_penalty / (2.0 * math.pi))
+            if penalty < best_penalty:
+                best_penalty = penalty
+                best_pair = (start, target, distance, mismatch_sum)
+
+            if distance_penalty == 0.0 and mismatch_penalty == 0.0:
+                profile.update({
+                    'endpoint_distance': distance,
+                    'heading_mismatch_sum_rad': mismatch_sum,
+                    'sampling_attempt': attempt,
+                    'strict_profile_match': True,
+                })
+                self.current_pose_sampling_profile = profile
+                rospy.loginfo(
+                    "Pose sampling profile: distance=%s %.2fm "
+                    "(target %.2f-%.2fm), complexity=%s %.1fdeg "
+                    "(attempt %d)",
+                    profile['distance_class'], distance,
+                    distance_min, distance_max,
+                    profile['complexity_class'],
+                    math.degrees(mismatch_sum), attempt)
+                return start, target
+
+        start, target, distance, mismatch_sum = best_pair
+        profile.update({
+            'endpoint_distance': distance,
+            'heading_mismatch_sum_rad': mismatch_sum,
+            'sampling_attempt': self.pose_sampling_max_attempts,
+            'strict_profile_match': False,
+        })
+        self.current_pose_sampling_profile = profile
+        rospy.logwarn(
+            "Could not exactly match pose profile after %d cheap attempts; "
+            "using closest stable pair: distance=%s %.2fm, complexity=%s "
+            "%.1fdeg, normalized penalty=%.4f",
+            self.pose_sampling_max_attempts,
+            profile['distance_class'], distance,
+            profile['complexity_class'], math.degrees(mismatch_sum),
+            best_penalty)
+        return start, target
+
+    def cancel_timer(self, attribute):
+        """取消并清空一个 rospy.Timer；重复调用是安全的。"""
+        if attribute == 'next_path_timer':
+            # shutdown 无法撤回已经排进回调队列的事件，用代次使其逻辑失效。
+            self.next_path_schedule_id += 1
+        timer = getattr(self, attribute, None)
+        setattr(self, attribute, None)
+        if timer is not None:
+            try:
+                timer.shutdown()
+            except Exception:
+                pass
+
+    def finish_active_planning_attempt(self):
+        """结束当前规划尝试，并确保其超时定时器不会影响后续尝试。"""
+        self.cancel_timer('planning_timeout_timer')
+        self.active_planning_attempt_id = None
+        self.waiting_for_result = False
+
+    def schedule_next_path(self, delay=None, reason=""):
+        """保证任意时刻最多只有一个待执行的路径生成定时器。"""
+        if delay is None:
+            delay = self.publish_delay
+        self.cancel_timer('next_path_timer')
+        schedule_id = self.next_path_schedule_id
+        expected_state = (
+            self.current_env_id, self.current_phase, self.current_path_id)
+
+        def callback(event):
+            if schedule_id != self.next_path_schedule_id:
+                rospy.logdebug(
+                    "Ignoring stale next-path timer generation %d (active=%d)",
+                    schedule_id, self.next_path_schedule_id)
+                return
+            self.next_path_timer = None
+            current_state = (
+                self.current_env_id, self.current_phase, self.current_path_id)
+            if current_state != expected_state:
+                rospy.logdebug(
+                    "Ignoring stale next-path timer: expected=%s current=%s",
+                    expected_state, current_state)
+                return
+            self.generate_next_path(event)
+
+        # rospy.Timer cannot represent a zero period. A 1 ms one-shot keeps
+        # the callback asynchronous while allowing map_ready_delay=0 now that
+        # the synchronous map-update service is the readiness barrier.
+        timer_delay = max(1e-3, float(delay))
+        self.next_path_timer = rospy.Timer(
+            rospy.Duration(timer_delay), callback, oneshot=True)
+        if reason:
+            rospy.logdebug("Scheduled next path in %.3fs (%s)", delay, reason)
+
+    def regenerate_if_retry_limit_reached(self):
+        """
+        当前裁剪区域长期无法生成合格路径时，重新裁剪整个环境。
+
+        这不会放宽轨迹要求，也不会保存失败结果；它只是避免在一个几乎
+        不可规划的裁剪上无限消耗时间。
+        """
+        limit = self.max_path_retries_before_regenerate
+        if limit <= 0 or self.path_retry_count < limit:
+            return False
+
+        self.retry_statistics['environment_regenerated'] += 1
+        rospy.logwarn(
+            "Path_%d failed %d consecutive attempts; regenerating "
+            "env%06d with a new crop instead of retrying indefinitely",
+            self.current_path_id, self.path_retry_count, self.current_env_id)
+        self.finish_active_planning_attempt()
+        self.cancel_timer('next_path_timer')
+        rospy.Timer(
+            rospy.Duration(self.publish_delay),
+            self.regenerate_current_environment, oneshot=True)
+        return True
     
     def planning_result_callback(self, msg):
         """规划结果回调函数"""
@@ -2150,10 +2917,16 @@ class TerrainDatasetGenerator:
             rospy.loginfo(f"Planning successful for path_{self.current_path_id}")
             # 等待轨迹消息
         else:
-            rospy.logwarn(f"Planning failed for path_{self.current_path_id}, retrying...")
-            self.waiting_for_result = False
-            # 延迟后重试
-            rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+            self.retry_statistics['planning_failed'] += 1
+            self.path_retry_count += 1
+            rospy.logwarn(
+                "Planning failed for path_%d (retry %d); sampling a new "
+                "prevalidated pose pair",
+                self.current_path_id, self.path_retry_count)
+            self.finish_active_planning_attempt()
+            if self.regenerate_if_retry_limit_reached():
+                return
+            self.schedule_next_path(reason="planning failed")
     
     def map_regeneration_callback(self, msg):
         """地图重新生成请求回调函数"""
@@ -2165,7 +2938,8 @@ class TerrainDatasetGenerator:
         rospy.logwarn(f"Current state: waiting_for_result={self.waiting_for_result}, current_path_id={self.current_path_id}")
         
         # 清理所有待处理状态，防止旧轨迹干扰
-        self.waiting_for_result = False
+        self.finish_active_planning_attempt()
+        self.cancel_timer('next_path_timer')
         self.current_trajectory = None
         
         # 重新生成当前环境的地形
@@ -2196,112 +2970,91 @@ class TerrainDatasetGenerator:
         # 如果无法获取轨迹点，视为无效
         if traj_points is None or len(traj_points) == 0:
             rospy.logwarn(f"Invalid or empty trajectory for path_{self.current_path_id}, retrying...")
-            self.waiting_for_result = False
-            rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+            self.retry_statistics['empty_trajectory'] += 1
+            self.path_retry_count += 1
+            self.finish_active_planning_attempt()
+            if self.regenerate_if_retry_limit_reached():
+                return
+            self.schedule_next_path(reason="empty trajectory")
             return
 
-        # 如果预计算了 yaw_scores，使用其进行精确验证
+        # 保存前使用与 MPT 完全一致的连续 stability hard gate。planner 和
+        # pose prefilter 仍可使用原 binary yaw map，不参与此最终验收。
         invalid_found = False
         unstable_count = 0
         total_points = len(traj_points)
         
-        # 强制要求使用预计算的 yaw_scores 进行验证；如果不可用则直接拒绝轨迹，避免回退导致保存不安全轨迹
-        if self.current_yaw_scores is None or self.current_map_bounds is None or self.current_resolution is None:
-            rospy.logwarn("Rejecting trajectory because precomputed yaw stability map or map bounds/resolution is unavailable")
+        # 缺少最终验收 ESDF 时直接拒绝，不能回退到 floor+binary 判定。
+        if (self.current_trajectory_stability_esdf is None or
+                self.current_map_bounds is None or
+                self.current_resolution is None):
+            rospy.logwarn(
+                "Rejecting trajectory because MPT stability ESDF or map "
+                "bounds/resolution is unavailable")
             invalid_found = True
         else:
-            min_x, max_x, min_y, max_y = self.current_map_bounds
-            H, W, Y = self.current_yaw_scores.shape[0], self.current_yaw_scores.shape[1], self.current_yaw_scores.shape[2]
-            
-            rospy.loginfo(f"Validating trajectory with {total_points} points against stability map shape {(H, W, Y)}")
-            rospy.loginfo(f"Map bounds: [{min_x:.2f}, {max_x:.2f}] x [{min_y:.2f}, {max_y:.2f}], resolution: {self.current_resolution:.3f}")
-            
-            for point_idx, (x, y, yaw) in enumerate(traj_points):
-                # 转换到栅格索引
-                ix = int(math.floor((x - min_x) / self.current_resolution))
-                iy = int(math.floor((y - min_y) / self.current_resolution))
-                
-                # 检查边界
-                if ix < 0 or ix >= W or iy < 0 or iy >= H:
-                    rospy.logwarn(f"Point {point_idx}: [{x:.3f},{y:.3f}] -> grid[{ix},{iy}] out of bounds [0,{W})x[0,{H})")
-                    invalid_found = True
-                    break
-
-                # yaw bin 计算
-                yaw_norm = yaw
-                # normalize to [-pi, pi)
-                while yaw_norm < -math.pi:
-                    yaw_norm += 2*math.pi
-                while yaw_norm >= math.pi:
-                    yaw_norm -= 2*math.pi
-                
-                bin_width = 2*math.pi / float(Y)
-                yidx = int(math.floor((yaw_norm + math.pi) / bin_width))
-                
-                # 确保yaw索引在有效范围内
-                yidx = max(0, min(yidx, Y-1))
-
-                # yaw_scores: 1 -> stable, 0 -> tipping
-                # 注意：numpy 数组的第一个维度是行（y / height），第二个维度是列（x / width）
-                try:
-                    val = self.current_yaw_scores[iy, ix, yidx]
-                    # val = self.current_yaw_scores[ix, iy, yidx]
-                    
-                    # val = self.current_yaw_scores[W - 1 - ix, H - 1 - iy, yidx]
-                    # val = self.current_yaw_scores[H - 1 - iy, W - 1 - ix, yidx]
-                except IndexError as e:
-                    rospy.logwarn(f"Point {point_idx}: index error at grid[{iy},{ix},{yidx}] for traj point [{x:.3f},{y:.3f},{yaw:.3f}]: {e}")
-                    invalid_found = True
-                    break
-
-                # 处理可能的 NaN / 非数值情况并进行阈值判定
-                try:
-                    # 将 val 转为浮点数后比较阈值
-                    val_float = float(val)
-                    
-                    # 检查是否为NaN或无效值
-                    if math.isnan(val_float) or math.isinf(val_float):
-                        rospy.logwarn(f"Point {point_idx}: NaN/Inf stability value at [{x:.3f},{y:.3f},{yaw:.3f}] -> grid[{iy},{ix},{yidx}]")
-                        invalid_found = True
-                        break
-                    
-                    # 稳定性判断：val > 0.5 表示稳定，<= 0.5 表示不稳定
-                    stable = val_float > 0.5
-                    
-                    if not stable:
-                        unstable_count += 1
-                        rospy.logwarn(f"Point {point_idx}: UNSTABLE at [{x:.3f},{y:.3f},{yaw:.3f}] -> grid[{iy},{ix},{yidx}], stability={val_float:.3f}")
-                        
-                        # 严格模式：任何一个点不稳定就拒绝整条轨迹
-                        invalid_found = True
-                        break
-                    else:
-                        # 可选：记录稳定点的调试信息
-                        if point_idx < 5 or point_idx % 20 == 0:  # 只记录前几个点和每20个点
-                            rospy.logdebug(f"Point {point_idx}: stable at [{x:.3f},{y:.3f},{yaw:.3f}] -> stability={val_float:.3f}")
-                            
-                except (ValueError, TypeError) as e:
-                    rospy.logwarn(f"Point {point_idx}: error processing stability value {val} at [{x:.3f},{y:.3f},{yaw:.3f}]: {e}")
-                    invalid_found = True
-                    break
+            validation = validate_trajectory_stability(
+                traj_points,
+                self.current_trajectory_stability_esdf,
+                self.current_map_bounds,
+                self.current_resolution,
+                d_safe=self.trajectory_stability_d_safe,
+            )
+            invalid_found = not validation['valid']
+            unstable_count = validation['invalid_count']
+            rospy.loginfo(
+                "Validating %d trajectory points against continuous MPT "
+                "stability ESDF %s (d_safe=%.3fm)",
+                total_points,
+                self.current_trajectory_stability_esdf.shape,
+                self.trajectory_stability_d_safe)
+            if invalid_found:
+                point_idx = validation['first_invalid_index']
+                reason = validation['first_invalid_reason']
+                margin = (
+                    float('nan') if point_idx is None
+                    else float(validation['margins'][point_idx]))
+                point = (
+                    [float('nan')] * 3 if point_idx is None
+                    else traj_points[point_idx])
+                rospy.logwarn(
+                    "Point %s fails continuous stability validation: "
+                    "reason=%s pose=[%.3f,%.3f,%.3f] margin=%.4fm "
+                    "required=%.4fm",
+                    point_idx, reason,
+                    float(point[0]), float(point[1]), float(point[2]),
+                    margin, self.trajectory_stability_d_safe)
+            else:
+                rospy.loginfo(
+                    "Continuous stability minimum margin: %.4fm",
+                    validation['minimum_margin'])
                     
         # 输出验证结果统计
         if not invalid_found:
-            rospy.loginfo(f"Trajectory validation PASSED: {total_points} points, all stable")
+            rospy.loginfo(
+                f"Trajectory validation PASSED: {total_points} points, "
+                "all margins satisfy d_safe")
         else:
             rospy.logwarn(f"Trajectory validation FAILED: {unstable_count}/{total_points} unstable points detected")
             
         if invalid_found:
-            rospy.logwarn(f"Trajectory for path_{self.current_path_id} invalid due to instability, retrying...")
-            self.waiting_for_result = False
+            self.retry_statistics['trajectory_unstable'] += 1
+            self.path_retry_count += 1
+            rospy.logwarn(
+                "Trajectory for path_%d is unstable (retry %d); keeping "
+                "strict validation and sampling another pair",
+                self.current_path_id, self.path_retry_count)
+            self.finish_active_planning_attempt()
+            if self.regenerate_if_retry_limit_reached():
+                return
             # 继续生成新的路径尝试
-            rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+            self.schedule_next_path(reason="unstable trajectory")
             return
 
         # 验证通过，接受轨迹并继续处理
         rospy.loginfo(f"Trajectory validation successful, saving path_{self.current_path_id}")
         self.current_trajectory = msg
-        self.waiting_for_result = False
+        self.finish_active_planning_attempt()
         self.process_trajectory()
 
     def sample_trajectory(self, trajectory):
@@ -2784,7 +3537,9 @@ class TerrainDatasetGenerator:
         
         if trajectory_path is None:
             rospy.logwarn(f"Invalid trajectory for path_{self.current_path_id}, retrying...")
-            rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+            self.retry_statistics['empty_trajectory'] += 1
+            self.path_retry_count += 1
+            self.schedule_next_path(reason="trajectory processing failed")
             return
         
         rospy.loginfo(f"Received trajectory with {len(trajectory_path)} points from C++")
@@ -2814,7 +3569,9 @@ class TerrainDatasetGenerator:
         # 创建路径数据，直接使用完整轨迹（不进行样条拟合）
         path_data = {
             'path': trajectory_path,  # 使用完整的原始轨迹
-            'map_name': env_name
+            'map_name': env_name,
+            'planner_map_version': self.current_planner_map_version,
+            'planner_map_request_id': self.map_update_request_id,
         }
         
         # 保存路径文件
@@ -2827,6 +3584,7 @@ class TerrainDatasetGenerator:
         # 更新计数
         self.current_path_id += 1
         self.paths_generated_for_current_env += 1
+        self.path_retry_count = 0
         
         # 检查当前环境是否完成
         target_paths = self.train_paths_per_env if self.current_phase == 'train' else self.val_paths_per_env
@@ -2835,22 +3593,22 @@ class TerrainDatasetGenerator:
             rospy.loginfo(f"Completed {self.current_phase} phase for environment {self.current_env_id}")
             
             if self.current_phase == 'train':
-                # 切换到验证阶段，复制地图文件到val目录
-                # 清理待处理状态，确保验证阶段有干净的开始
-                self.waiting_for_result = False
+                # val拥有独立地图；多源地图时还会避开同index train所用源。
+                self.finish_active_planning_attempt()
                 self.current_trajectory = None
                 
                 self.current_phase = 'val'
                 self.current_path_id = 0
                 self.paths_generated_for_current_env = 0
-                
-                
-                # 复制地图文件到验证目录
-                self.copy_map_to_val_directory()
+                self.generate_new_environment()
+                self.schedule_next_path(
+                    delay=self.map_ready_delay,
+                    reason="independent validation environment ready")
+                return
             else:
                 # 当前环境完全完成，移动到下一个环境
                 # 清理待处理状态，防止旧轨迹干扰新环境
-                self.waiting_for_result = False
+                self.finish_active_planning_attempt()
                 self.current_trajectory = None
                 
                 self.current_env_id += 1
@@ -2860,24 +3618,44 @@ class TerrainDatasetGenerator:
                 
                 # 检查是否所有环境都已完成
                 if self.current_env_id >= self.start_env_id + self.num_environments:
-                    rospy.loginfo("Dataset generation completed!")
+                    rospy.loginfo(
+                        "Dataset generation completed! Retry statistics: %s",
+                        self.retry_statistics)
                     rospy.signal_shutdown("Dataset generation completed")
                     return
                 
                 # 生成新环境
+                self.cancel_timer('next_path_timer')
                 rospy.Timer(rospy.Duration(1.0), self.start_new_environment, oneshot=True)
                 return
         
         # 生成当前环境的下一条路径
-        rospy.Timer(rospy.Duration(self.publish_delay), self.generate_next_path, oneshot=True)
+        self.schedule_next_path(reason="previous path saved")
     
     def regenerate_current_environment(self, event):
         """重新生成当前环境的地形"""
         rospy.logwarn(f"Regenerating terrain for env{self.current_env_id:06d}")
         
         # 清理待处理状态，防止旧轨迹干扰
-        self.waiting_for_result = False
+        self.finish_active_planning_attempt()
+        self.cancel_timer('next_path_timer')
         self.current_trajectory = None
+
+        # train/val地图相互独立。失败重建只清理并重做当前split，避免已经
+        # 完成的另一split被无关失败覆盖。
+        env_name = f"env{self.current_env_id:06d}"
+        phase_dir = (
+            self.train_dir if self.current_phase == 'train' else self.val_dir)
+        env_dir = os.path.join(phase_dir, env_name)
+        for pattern in ('path_*.p', 'map.p', 'terrain_2d.png',
+                        'terrain_3d.png'):
+            for old_file in glob.glob(os.path.join(env_dir, pattern)):
+                try:
+                    os.remove(old_file)
+                except OSError as exc:
+                    rospy.logwarn(
+                        "Failed to remove stale generated file %s: %s",
+                        old_file, exc)
         
         # 重置当前路径ID为0，重新开始生成该环境的路径
         self.current_path_id = 0
@@ -2886,22 +3664,30 @@ class TerrainDatasetGenerator:
         # 重新生成地形
         env_dir = self.generate_new_environment()
         
-        # 给更多时间让地图系统处理新地形
-        rospy.Timer(rospy.Duration(5.0), self.generate_next_path, oneshot=True)
+        self.schedule_next_path(
+            delay=self.map_ready_delay, reason="environment regenerated")
     
     def start_new_environment(self, event):
         """开始新环境"""
         env_dir = self.generate_new_environment()
         # 延迟后开始生成路径
-        rospy.Timer(rospy.Duration(2.0), self.generate_next_path, oneshot=True)
+        self.schedule_next_path(
+            delay=self.map_ready_delay, reason="new environment ready")
     
     def generate_next_path(self, event):
         """生成下一条路径"""
         # 检查系统状态，避免在不合适的时候发送位姿
         if self.waiting_for_result:
-            # rospy.logwarn("Still waiting for previous result, skipping path generation")
-            # 延迟重试
-            rospy.Timer(rospy.Duration(1.0), self.generate_next_path, oneshot=True)
+            rospy.logdebug(
+                "Still waiting for planning attempt %s; ignoring duplicate "
+                "path-generation trigger", self.active_planning_attempt_id)
+            return
+
+        if not self.planner_is_connected():
+            rospy.logfatal(
+                "Planner connections were lost before path_%d; stopping this "
+                "worker instead of waiting forever", self.current_path_id)
+            rospy.signal_shutdown("only_planner disconnected")
             return
         
         # 生成随机位姿对
@@ -2913,32 +3699,100 @@ class TerrainDatasetGenerator:
         
         # 设置等待状态
         self.waiting_for_result = True
+        self.planning_attempt_id += 1
+        attempt_id = self.planning_attempt_id
+        self.active_planning_attempt_id = attempt_id
         
         # 更新期望的路径ID
         self.expected_path_id = self.current_path_id
         
         env_name = f"env{self.current_env_id:06d}"
-        rospy.loginfo(f"Generating path_{self.current_path_id} for {env_name} ({self.current_phase})")
+        rospy.loginfo(
+            "Generating path_%d for %s (%s), planning attempt=%d, retry=%d",
+            self.current_path_id, env_name, self.current_phase,
+            attempt_id, self.path_retry_count)
         rospy.loginfo(f"  Pose bounds: X[{self.map_x_min:.1f}, {self.map_x_max:.1f}], Y[{self.map_y_min:.1f}, {self.map_y_max:.1f}]")
         rospy.loginfo(f"  Start: [{start_x:.3f}, {start_y:.3f}, {start_yaw:.3f}]")
         rospy.loginfo(f"  Target: [{target_x:.3f}, {target_y:.3f}, {target_yaw:.3f}]")
         
         # 发布位姿
+        start_pose.header.seq = attempt_id
+        target_pose.header.seq = attempt_id
         self.start_pose_pub.publish(start_pose)
         rospy.sleep(0.1)
         self.target_pose_pub.publish(target_pose)
         
-        # 添加超时检查，防止永久等待
-        rospy.Timer(rospy.Duration(self.map_update_timeout), self.check_planning_timeout, oneshot=True)
-    
-    def check_planning_timeout(self, event):
-        """检查规划超时"""
-        if self.waiting_for_result:
-            rospy.logwarn(f"Planning timeout detected for path_{self.current_path_id}, resetting state")
-            self.waiting_for_result = False
-            # 延迟重试生成路径
-            rospy.Timer(rospy.Duration(1.0), self.generate_next_path, oneshot=True)
-    
+        # 看门狗只监控本次尝试。规划器不能被ROS定时器真正取消，因此超时后
+        # 不发送并发请求；否则旧请求完成时会被误认为新请求的结果。
+        self.cancel_timer('planning_timeout_timer')
+        self.planning_timeout_timer = rospy.Timer(
+            rospy.Duration(self.map_update_timeout),
+            lambda timer_event: self.check_planning_timeout(
+                timer_event, attempt_id),
+            oneshot=True)
+
+    def check_planning_timeout(self, event, attempt_id=None):
+        """规划看门狗：报告慢规划，但不与尚未结束的规划并发重试。"""
+        if (not self.waiting_for_result or
+                attempt_id != self.active_planning_attempt_id):
+            return
+        if not self.planner_is_connected():
+            self.finish_active_planning_attempt()
+            rospy.logfatal(
+                "Planner disconnected during attempt %d for path_%d; "
+                "stopping this worker instead of waiting forever",
+                attempt_id, self.current_path_id)
+            rospy.signal_shutdown("only_planner disconnected")
+            return
+        self.retry_statistics['watchdog_timeout'] += 1
+        rospy.logwarn(
+            "Planning attempt %d for path_%d has run for %.1fs; still "
+            "waiting instead of launching an overlapping retry",
+            attempt_id, self.current_path_id, self.map_update_timeout)
+        self.planning_timeout_timer = rospy.Timer(
+            rospy.Duration(self.map_update_timeout),
+            lambda timer_event: self.check_planning_timeout(
+                timer_event, attempt_id),
+            oneshot=True)
+
+    def planner_is_connected(self):
+        """规划请求与结果两个方向都建立连接后才认为规划器可用。"""
+        return (
+            self.start_pose_pub.get_num_connections() > 0 and
+            self.target_pose_pub.get_num_connections() > 0 and
+            self.result_sub.get_num_connections() > 0 and
+            self.traj_sub.get_num_connections() > 0)
+
+    def wait_for_planner(self):
+        """等待规划器完成地图/KD-tree初始化，超时则明确退出。"""
+        deadline = time.monotonic() + self.planner_connection_timeout
+        rospy.loginfo(
+            "Waiting up to %.1fs for only_planner connections...",
+            self.planner_connection_timeout)
+        try:
+            rospy.wait_for_service(
+                'update_terrain_map',
+                timeout=self.planner_connection_timeout)
+        except rospy.ROSException:
+            rospy.logfatal(
+                "only_planner did not advertise update_terrain_map within "
+                "%.1fs", self.planner_connection_timeout)
+            rospy.signal_shutdown("planner map update service timeout")
+            return False
+        while not rospy.is_shutdown():
+            if self.planner_is_connected():
+                rospy.loginfo("only_planner is connected; starting generation")
+                return True
+            if time.monotonic() >= deadline:
+                rospy.logfatal(
+                    "only_planner did not establish all request/result "
+                    "connections within %.1fs",
+                    self.planner_connection_timeout)
+                rospy.signal_shutdown("only_planner connection timeout")
+                return False
+            rospy.sleep(0.2)
+        return False
+
     def start_generation(self):
         """开始数据集生成"""
         rospy.loginfo(f"Starting terrain dataset generation:")
@@ -2946,8 +3800,9 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"  Paths per environment: {self.train_paths_per_env} (train) + {self.val_paths_per_env} (val)")
         rospy.loginfo(f"  Total paths: {self.num_environments * (self.train_paths_per_env + self.val_paths_per_env)}")
         
-        # 等待其他节点启动
-        rospy.sleep(5.0)
+        # 规划器只有在地图和KD-tree初始化完毕后才创建订阅/发布连接。
+        if not self.wait_for_planner():
+            return
         
         # 生成第一个环境
         self.start_new_environment(None)
@@ -2968,9 +3823,9 @@ class TerrainDatasetGenerator:
         # 对于外部地图，使用目标参数；对于生成地图，使用默认参数
         if self.use_external_map:
             # 使用外部地图的目标参数
-            map_size_x = rospy.get_param('~target_map_size', self.map_size)
+            map_size_x = self.target_map_size
             map_size_y = map_size_x
-            xy_res = rospy.get_param('~target_resolution', 0.4)
+            xy_res = self.target_resolution
         else:
             # 使用默认的地图参数
             map_size_x = rospy.get_param('uneven_map/map_size_x', rospy.get_param('map_size', 10.0))
@@ -3067,41 +3922,18 @@ class TerrainDatasetGenerator:
 
                 stability_map = np.array(stability_map)
 
-                # 规范形状为 (H, W, Y)
+                # 规范合同只有 (H=row=y, W=column=x, Y=yaw)。这里禁止
+                # transpose/resize 猜测，否则方形生产地图会静默掩盖H/W错误。
                 H = occ.info.height
                 W = occ.info.width
                 Y = int(yaw_bins)
-
-                if stability_map.ndim == 3:
-                    # 尝试匹配形状 (H, W, Y) 或其它排列
-                    if stability_map.shape == (H, W, Y):
-                        aligned = stability_map
-                    elif stability_map.shape == (Y, H, W):
-                        aligned = np.transpose(stability_map, (1, 2, 0))
-                    elif stability_map.shape == (W, H, Y):
-                        aligned = np.transpose(stability_map, (1, 0, 2))
-                    elif stability_map.shape == (H, Y, W):
-                        aligned = np.transpose(stability_map, (0, 2, 1))
-                    else:
-                        # 无法直接匹配，尝试 resize
-                        aligned = np.resize(stability_map, (H, W, Y))
-                elif stability_map.ndim == 2:
-                    # (H, W) -> 添加 yaw 维度
-                    aligned = stability_map[..., np.newaxis]
-                    if aligned.shape[2] != Y:
-                        aligned = np.resize(aligned, (H, W, Y))
-                elif stability_map.ndim == 1:
-                    # 尝试重塑为 (H, W, Y)
-                    try:
-                        aligned = stability_map.reshape((H, W, -1))
-                        if aligned.shape[2] != Y:
-                            aligned = np.resize(aligned, (H, W, Y))
-                    except Exception:
-                        aligned = np.resize(stability_map, (H, W, Y))
-                else:
-                    aligned = np.resize(stability_map, (H, W, Y))
-
-                stability_map = np.array(aligned, dtype=np.float32)
+                expected_shape = (H, W, Y)
+                if stability_map.shape != expected_shape:
+                    raise ValueError(
+                        "stability map must use (H=row=y,W=column=x,Y=yaw): "
+                        f"{stability_map.shape} != {expected_shape}")
+                stability_map = np.asarray(
+                    stability_map, dtype=np.float32)
                 
                 # 将x和y进行互换
                 # stability_map = np.transpose(stability_map, (1, 0, 2))
@@ -3122,50 +3954,40 @@ class TerrainDatasetGenerator:
                 # 映射到 0-100 的整数占用值（100 表示占用）
                 occ_vals_2d = (per_cell_tipping * 100.0).round().astype(np.int8)
 
-                # 确保形状为 (H, W)
-                if occ_vals_2d.shape != (H, W):
-                    occ_vals_2d = np.resize(occ_vals_2d, (H, W))
-
-                # 同时构造并发布一个三维 HWY 的消息（Float32MultiArray），供期望三维输入的接收方使用
-                try:
-                    from std_msgs.msg import Float32MultiArray, MultiArrayDimension
-                    fam = Float32MultiArray()
-                    # 填充数据（浮点，0..1 表示 tipping 概率）
-                    fam.data = tipping_map.flatten().astype(np.float32).tolist()
-                    # 布局: dim[0]=height, dim[1]=width, dim[2]=yaw
-                    dim_h = MultiArrayDimension()
-                    dim_h.label = 'height'
-                    dim_h.size = int(H)
-                    dim_h.stride = int(W * Y)
-                    dim_w = MultiArrayDimension()
-                    dim_w.label = 'width'
-                    dim_w.size = int(W)
-                    dim_w.stride = int(Y)
-                    dim_y = MultiArrayDimension()
-                    dim_y.label = 'yaw'
-                    dim_y.size = int(Y)
-                    dim_y.stride = 1
-                    fam.layout.dim = [dim_h, dim_w, dim_y]
-                    fam.layout.data_offset = 0
-
-                    # 发布（非阻塞）
-                    try:
-                        self.occ3d_pub.publish(fam)
-                    except Exception as e:
-                        rospy.logwarn(f"Failed to publish 3D HWY occupancy array: {e}")
-                except Exception as e:
-                    rospy.logwarn(f"Failed to build/publish 3D HWY occupancy array: {e}")
+                from std_msgs.msg import (
+                    Float32MultiArray,
+                    MultiArrayDimension,
+                )
+                fam = Float32MultiArray()
+                fam.data = tipping_map.flatten().astype(
+                    np.float32).tolist()
+                dim_h = MultiArrayDimension()
+                dim_h.label = 'height'
+                dim_h.size = int(H)
+                dim_h.stride = int(W * Y)
+                dim_w = MultiArrayDimension()
+                dim_w.label = 'width'
+                dim_w.size = int(W)
+                dim_w.stride = int(Y)
+                dim_y = MultiArrayDimension()
+                dim_y.label = 'yaw'
+                dim_y.size = int(Y)
+                dim_y.stride = 1
+                fam.layout.dim = [dim_h, dim_w, dim_y]
+                fam.layout.data_offset = 0
 
                 # 发布二维 OccupancyGrid 以兼容仅接受 2D 的节点
                 occ.data = occ_vals_2d.flatten().tolist()
 
-                return occ
+                return occ, fam
             except Exception as e:
-                rospy.logwarn("Failed to compute occupancy data from yaw stability map: %s", str(e))
+                raise RuntimeError(
+                    "Failed to compute strict HWY occupancy: "
+                    f"{e}") from e
 
-        # 若无法基于法向量计算占用，保留默认未知(-1)或之前填充的数据
-        occ.data = data.flatten().tolist()
-        return occ
+        raise RuntimeError(
+            "normal_x, normal_y and normal_z are required for planner "
+            "occupancy")
 
     def load_external_map(self):
         """
@@ -3235,7 +4057,7 @@ class TerrainDatasetGenerator:
             target_map_size: 目标地图尺寸（米）
             target_resolution: 目标分辨率（米）
         """
-        expected_grid_size = int(target_map_size / target_resolution)
+        expected_grid_size = int(round(target_map_size / target_resolution))
         actual_shape = grid_map_data['elevation'].shape
         
         rospy.loginfo("=== External Map Processing Validation ===")
@@ -3245,11 +4067,12 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"Actual grid shape: {actual_shape}")
         rospy.loginfo(f"Bounds: {grid_map_data.get('bounds', 'Unknown')}")
         rospy.loginfo(f"Resolution: {grid_map_data.get('resolution', 'Unknown')}")
-        rospy.loginfo("Processing method: Center cropping (preserves original resolution)")
+        rospy.loginfo(
+            "Processing method: Random translated/rotated point-cloud crop")
         
         # 验证栅格尺寸
         if actual_shape == (expected_grid_size, expected_grid_size):
-            rospy.loginfo("✓ Grid size matches target after cropping")
+            rospy.loginfo("✓ Grid size matches rotated crop target")
         else:
             rospy.logwarn(f"✗ Grid size mismatch: expected ({expected_grid_size}, {expected_grid_size}), got {actual_shape}")
         
@@ -3267,6 +4090,22 @@ class TerrainDatasetGenerator:
             rospy.loginfo("✓ Resolution matches target")
         else:
             rospy.logwarn(f"✗ Resolution mismatch: expected {target_resolution}, got {actual_resolution}")
+
+        # 训练和规划都不应接收到空高程或空法向量。尤其在聚合分辨率
+        # 改为真实0.2m后，这项检查可以及时暴露点云覆盖不足。
+        for channel_name in (
+                'elevation', 'normal_x', 'normal_y', 'normal_z'):
+            channel = np.asarray(grid_map_data.get(channel_name))
+            if channel.shape != actual_shape:
+                raise RuntimeError(
+                    f"External map channel {channel_name} has shape "
+                    f"{channel.shape}, expected {actual_shape}")
+            invalid_count = int(channel.size - np.isfinite(channel).sum())
+            if invalid_count:
+                raise RuntimeError(
+                    f"External map channel {channel_name} contains "
+                    f"{invalid_count}/{channel.size} invalid cells")
+        rospy.loginfo("✓ All elevation and normal cells are finite")
         
         rospy.loginfo("=" * 45)
         

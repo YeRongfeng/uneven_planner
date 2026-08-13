@@ -1,22 +1,32 @@
 #include "plan_manager/pointcloud_to_grid_converter.h"
 #include <cmath>
+#include <stdexcept>
 
 PointCloudToGridConverter::PointCloudToGridConverter(ros::NodeHandle n) : nh_(n)
 {
     processed_pts_.reset(new PointCloud<PointType>());
     cloud_normals_.reset(new PointCloud<Normal>());
     
-    // 设置参数（匹配grid_transformer.cpp）
-    grid_coarse_resolution_ = 0.4;   // 粗分辨率用于栅格化
-    grid_fine_resolution_ = 0.2;     // 精细分辨率用于最终输出
-    voxel_size_ = 0.2;               // 体素降采样大小
+    // 从节点私有命名空间读取参数，使 launch 中的转换分辨率真正生效。
+    ros::NodeHandle private_nh("~");
+    private_nh.param("grid_coarse_resolution", grid_coarse_resolution_, 0.2f);
+    private_nh.param("grid_fine_resolution", grid_fine_resolution_, 0.2f);
+    private_nh.param("voxel_size", voxel_size_, 0.2f);
+
+    if (grid_coarse_resolution_ <= 0.0f ||
+        grid_fine_resolution_ <= 0.0f ||
+        voxel_size_ <= 0.0f) {
+        throw std::invalid_argument("Grid resolutions and voxel size must be positive");
+    }
     
     // 注册服务
     convert_service_ = nh_.advertiseService("pointcloud_to_grid", 
                                            &PointCloudToGridConverter::convertCallback, 
                                            this);
     
-    ROS_INFO("PointCloud to Grid Converter Service started!");
+    ROS_INFO("PointCloud to Grid Converter Service started "
+             "(coarse=%.3fm, fine=%.3fm, voxel=%.3fm)",
+             grid_coarse_resolution_, grid_fine_resolution_, voxel_size_);
 }
 
 PointCloudToGridConverter::~PointCloudToGridConverter()
@@ -37,7 +47,8 @@ bool PointCloudToGridConverter::convertCallback(plan_manager::PointCloudToGrid::
                     res.elevation_grid, res.normal_x_grid, res.normal_y_grid, res.normal_z_grid,
                     res.grid_width, res.grid_height);
         
-        res.resolution = grid_coarse_resolution_;
+        // 返回数组实际使用的精细分辨率，而不是中间粗栅格分辨率。
+        res.resolution = grid_fine_resolution_;
         res.success = true;
         res.message = "Conversion successful";
         
@@ -106,9 +117,11 @@ void PointCloudToGridConverter::gridGenerate(float map_min_x, float map_min_y,
     float length_x = map_max_x - map_min_x;
     float length_y = map_max_y - map_min_y;
     
-    // 首先使用粗分辨率（0.4m）进行栅格化，得到粗栅格
-    int coarse_width = static_cast<int>(std::ceil(length_x / grid_coarse_resolution_));
-    int coarse_height = static_cast<int>(std::ceil(length_y / grid_coarse_resolution_));
+    // 首先使用配置的粗分辨率进行栅格化，得到粗栅格
+    int coarse_width = static_cast<int>(
+        std::ceil(length_x / grid_coarse_resolution_ - 1e-6f));
+    int coarse_height = static_cast<int>(
+        std::ceil(length_y / grid_coarse_resolution_ - 1e-6f));
     
     ROS_INFO("Coarse grid dimensions: %.2f x %.2f m", length_x, length_y);
     ROS_INFO("Coarse grid resolution: %.2f m", grid_coarse_resolution_);
@@ -140,9 +153,11 @@ void PointCloudToGridConverter::gridGenerate(float map_min_x, float map_min_y,
     
     ROS_INFO("Coarse grid generation completed!");
     
-    // 计算精细栅格尺寸（0.2m分辨率）- 这应该输出205x205
-    grid_width = static_cast<int>(std::ceil(length_x / grid_fine_resolution_));
-    grid_height = static_cast<int>(std::ceil(length_y / grid_fine_resolution_));
+    // 计算最终精细栅格尺寸
+    grid_width = static_cast<int>(
+        std::ceil(length_x / grid_fine_resolution_ - 1e-6f));
+    grid_height = static_cast<int>(
+        std::ceil(length_y / grid_fine_resolution_ - 1e-6f));
     
     ROS_INFO("Fine grid resolution: %.2f m", grid_fine_resolution_);
     ROS_INFO("Fine grid cells: %d x %d", grid_width, grid_height);

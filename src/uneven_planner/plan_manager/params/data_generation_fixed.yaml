@@ -1,11 +1,11 @@
 uneven_map:
   iter_num: 2
-  map_size_x: 40.0
-  map_size_y: 40.0
+  map_size_x: 20.0
+  map_size_y: 20.0
   ellipsoid_x: 0.2
   ellipsoid_y: 0.1
   ellipsoid_z: 0.1
-  xy_resolution: 0.4
+  xy_resolution: 0.2
   yaw_resolution: 0.1
   min_cnormal: 0.8               # 最小法向量 (无量纲)
   max_rho: 0.001
@@ -24,7 +24,7 @@ kino_astar:
   weight_sigma: 10.0          # 侧向位移项的权重
   time_interval: 1.2          # 时间间隔 (s)
   collision_interval: 0.06    # 碰撞检测间隔 (s)
-  oneshot_range: 4.0          # 一次性规划范围 (m) - 适配40m地图的较大规划距离
+  oneshot_range: 4.0          # 一次性规划范围 (m)
   wheel_base: 0.26            # 车辆轴距 (m)
   max_steer: 0.4              # 最大转向角 (弧度)
   max_vel: 0.5                # 最大速度 (m/s)
@@ -56,6 +56,7 @@ alm_traj_opt:
   in_debug: false             # 是否在调试模式下运行
 
 manager:
+  internal_retry_on_failure: false # 数据集生成器统一管理重试，避免规划器重复重试
   piece_len: 0.3              # 轨迹片段长度 (m)
   mean_vel: 0.5               # 平均速度 (m/s)
   init_time_times: 1.2        # 初始化时间倍数 (无量纲)
@@ -65,18 +66,18 @@ manager:
   resample_points: 22         # 重新采样点数 (无量纲)
   # min_planning_distance: 4.5  # 最小规划距离 (m)
   # max_planning_distance: 6.0  # 最大规划距离 (m)
-  min_planning_distance: 16.0  # 最小规划距离 (m)
-  max_planning_distance: 100.0  # 最大规划距离 (m)
+  min_planning_distance: 6.0   # 最小规划距离 (m)，适配20m地图
+  max_planning_distance: 22.0  # 最大规划距离 (m)，不超过有效区域对角线
   start_fixed: [-999.0, -999.0, -999.0]  # 固定起点 (m, m, rad)
   end_fixed: [-999.0, -999.0, -999.0]    # 固定终点 (m, m, rad)
 
 # 数据集生成相关参数
 terrain_dataset_generator:
-  map_size: 40.0              # 地图尺寸 (m)
+  map_size: 20.0              # 地图尺寸 (m)
   map_resolution: 0.02        # 地图分辨率 (m)
   voxel_size: 0.2             # 体素大小 (m)
-  coarse_resolution: 0.8      # 粗分辨率 (m)
-  fine_resolution: 0.4        # 精细分辨率 (m)
+  coarse_resolution: 0.4      # 粗分辨率 (m)
+  fine_resolution: 0.2        # 精细分辨率 (m)，20/0.2=100
   min_distance: 1.5           # 最小距离 (m)
   publish_delay: 0.05         # 发布延迟 (s)
   min_height: -3.0            # 最小高度 (m)

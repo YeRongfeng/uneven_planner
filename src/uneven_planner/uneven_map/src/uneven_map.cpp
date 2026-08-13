@@ -141,8 +141,19 @@ namespace uneven_planner
         pcl::PointCloud<pcl::PointXYZ> cloudMapOrigin;
         pcl::PointCloud<pcl::PointXYZ> cloudMapClipper;
 
+        if (pcd_file.empty())
+        {
+            ROS_FATAL("UnevenMap: uneven_map/map_pcd is empty; refusing to initialize an empty KD-tree");
+            throw std::runtime_error("UnevenMap map_pcd parameter is empty");
+        }
+
         pcl::PCDReader reader;
-        reader.read<pcl::PointXYZ>(pcd_file, cloudMapOrigin);
+        const int read_result = reader.read<pcl::PointXYZ>(pcd_file, cloudMapOrigin);
+        if (read_result < 0 || cloudMapOrigin.empty())
+        {
+            ROS_FATAL("UnevenMap: failed to read a non-empty point cloud from '%s'", pcd_file.c_str());
+            throw std::runtime_error("UnevenMap failed to load point cloud");
+        }
 
         pcl::CropBox<pcl::PointXYZ> clipper;
         clipper.setMin(Eigen::Vector4f(-10.0, -10.0, -0.01, 1.0));
@@ -156,6 +167,11 @@ namespace uneven_planner
         dwzFilter.setInputCloud(cloudMapClipper.makeShared());
         dwzFilter.filter(*world_cloud);
         cloudMapClipper.clear();
+        if (world_cloud->empty())
+        {
+            ROS_FATAL("UnevenMap: point cloud '%s' has no points inside the configured crop box", pcd_file.c_str());
+            throw std::runtime_error("UnevenMap point cloud is empty after filtering");
+        }
 
         for (size_t i=0; i<world_cloud->points.size(); i++)
         {
@@ -284,124 +300,325 @@ namespace uneven_planner
         map_ready = true;
     }
 
-    void UnevenMap::occMapCallback(const std_msgs::Float32MultiArrayConstPtr& msg)
+    bool UnevenMap::decodeExternalOccupancy(
+        const std_msgs::Float32MultiArray& msg,
+        vector<char>& decoded_occ,
+        vector<char>& decoded_occ_r2,
+        size_t& occupied_voxel_count,
+        size_t& occupied_xy_count,
+        string& error)
     {
-        std::lock_guard<std::mutex> lk(occ_mutex);
-
-        int vx = voxel_num(0);
-        int vy = voxel_num(1);
-        int vz = voxel_num(2);
-
-        if (vx <= 0 || vy <= 0 || vz <= 0) {
-            ROS_WARN_THROTTLE(5.0, "occMapCallback: voxel_num not initialized yet, skipping occupancy update");
-            return;
+        const int vx = voxel_num(0);
+        const int vy = voxel_num(1);
+        const int vz = voxel_num(2);
+        if (vx <= 0 || vy <= 0 || vz <= 0)
+        {
+            error = "UnevenMap dimensions are not initialized";
+            return false;
         }
 
-        // determine message dimensions from layout if present
-        size_t data_len = msg->data.size();
-        int msg_h = 0, msg_w = 0, msg_yaw_bins = 0;
-        if (msg->layout.dim.size() >= 3) {
-            msg_h = static_cast<int>(msg->layout.dim[0].size);
-            msg_w = static_cast<int>(msg->layout.dim[1].size);
-            msg_yaw_bins = static_cast<int>(msg->layout.dim[2].size);
-        } else if (msg->layout.dim.size() == 2) {
-            // maybe only H and W provided, assume single yaw
-            msg_h = static_cast<int>(msg->layout.dim[0].size);
-            msg_w = static_cast<int>(msg->layout.dim[1].size);
-            msg_yaw_bins = 1;
-        } else {
-            // fall back: try to infer from parameters
-            // we expect data_len == H*W*Y
-            // try to use voxel_num XY as H and W
-            msg_h = vx;
-            msg_w = vy;
-            if (msg_h * msg_w > 0) {
-                if (data_len % (msg_h * msg_w) == 0) {
-                    msg_yaw_bins = static_cast<int>(data_len / (msg_h * msg_w));
-                } else {
-                    ROS_WARN("occMapCallback: Float32MultiArray data length %zu not compatible with inferred H*W %d, skipping", data_len, msg_h*msg_w);
-                    return;
-                }
+        if (msg.layout.dim.size() != 3)
+        {
+            error = "occupancy_hwy layout must have exactly [height,width,yaw]";
+            return false;
+        }
+        if (msg.layout.data_offset != 0)
+        {
+            error = "occupancy_hwy data_offset must be zero";
+            return false;
+        }
+
+        const int msg_h = static_cast<int>(msg.layout.dim[0].size);
+        const int msg_w = static_cast<int>(msg.layout.dim[1].size);
+        const int msg_yaw_bins =
+            static_cast<int>(msg.layout.dim[2].size);
+        if (msg.layout.dim[0].label != "height" ||
+            msg.layout.dim[1].label != "width" ||
+            msg.layout.dim[2].label != "yaw")
+        {
+            error = "occupancy_hwy labels must be height,width,yaw";
+            return false;
+        }
+        if (msg_h != vy || msg_w != vx || msg_yaw_bins <= 0)
+        {
+            std::ostringstream oss;
+            oss << "occupancy_hwy shape must be H=" << vy
+                << ", W=" << vx << ", Y>0; got H=" << msg_h
+                << ", W=" << msg_w << ", Y=" << msg_yaw_bins;
+            error = oss.str();
+            return false;
+        }
+        const size_t expected =
+            static_cast<size_t>(msg_h) * static_cast<size_t>(msg_w) *
+            static_cast<size_t>(msg_yaw_bins);
+        if (msg.data.size() != expected)
+        {
+            std::ostringstream oss;
+            oss << "occupancy_hwy data length " << msg.data.size()
+                << " does not match H*W*Y=" << expected;
+            error = oss.str();
+            return false;
+        }
+        if (msg.layout.dim[0].stride !=
+                static_cast<uint32_t>(msg_w * msg_yaw_bins) ||
+            msg.layout.dim[1].stride !=
+                static_cast<uint32_t>(msg_yaw_bins) ||
+            msg.layout.dim[2].stride != 1)
+        {
+            error = "occupancy_hwy strides must be W*Y,Y,1";
+            return false;
+        }
+        for (size_t i = 0; i < msg.data.size(); ++i)
+        {
+            const float value = msg.data[i];
+            if (!std::isfinite(value) || value < 0.0f || value > 1.0f)
+            {
+                std::ostringstream oss;
+                oss << "occupancy_hwy[" << i
+                    << "] must be finite and in [0,1]";
+                error = oss.str();
+                return false;
             }
         }
 
-        if (msg_h <= 0 || msg_w <= 0 || msg_yaw_bins <= 0) {
-            ROS_WARN("occMapCallback: invalid dimensions in Float32MultiArray, skipping");
-            return;
-        }
+        decoded_occ.assign(
+            static_cast<size_t>(vx) * static_cast<size_t>(vy) *
+                static_cast<size_t>(vz),
+            0);
+        decoded_occ_r2.assign(
+            static_cast<size_t>(vx) * static_cast<size_t>(vy), 0);
+        occupied_voxel_count = 0;
+        occupied_xy_count = 0;
+        const double threshold =
+            static_cast<double>(occ_threshold) / 100.0;
 
-        size_t expected = static_cast<size_t>(msg_h) * static_cast<size_t>(msg_w) * static_cast<size_t>(msg_yaw_bins);
-        if (expected != data_len) {
-            ROS_WARN("occMapCallback: data length %zu does not match expected H*W*Y %zu, skipping", data_len, expected);
-            return;
-        }
+        // Python flattens C-order (H=row=y, W=column=x, Y=yaw).
+        // Fill every internal yaw bin by looking up the source bin containing
+        // that bin's physical center. This is periodic and also fills the
+        // receiver's 64th bin when the sender has ceil(2*pi/0.1)=63 bins.
+        for (int x = 0; x < vx; ++x)
+        {
+            for (int y = 0; y < vy; ++y)
+            {
+                bool xy_occupied = false;
+                for (int dst_yaw = 0; dst_yaw < vz; ++dst_yaw)
+                {
+                    double theta =
+                        map_origin(2) +
+                        (static_cast<double>(dst_yaw) + 0.5) *
+                            yaw_resolution;
+                    double phase = std::fmod(theta + M_PI, 2.0 * M_PI);
+                    if (phase < 0.0)
+                        phase += 2.0 * M_PI;
+                    int src_yaw = static_cast<int>(std::floor(
+                        phase * static_cast<double>(msg_yaw_bins) /
+                        (2.0 * M_PI)));
+                    src_yaw = std::max(
+                        0, std::min(src_yaw, msg_yaw_bins - 1));
 
-        // prepare XY occupancy flags (will compute OR across yaw slices)
-        std::vector<char> xy_flags(static_cast<size_t>(msg_h) * static_cast<size_t>(msg_w), 0);
-
-        // sender flattened as C-order for (H,W,Y): idx = h*(W*Y) + w*(Y) + yaw
-        for (int hh = 0; hh < msg_h; ++hh) {
-            for (int ww = 0; ww < msg_w; ++ww) {
-                for (int yslice = 0; yslice < msg_yaw_bins; ++yslice) {
-                    size_t idx = static_cast<size_t>(hh) * static_cast<size_t>(msg_w) * static_cast<size_t>(msg_yaw_bins)
-                               + static_cast<size_t>(ww) * static_cast<size_t>(msg_yaw_bins)
-                               + static_cast<size_t>(yslice);
-                    if (idx >= data_len) continue;
-                    float fv = msg->data[idx];
-
-                    // compute world coord of this cell center
-                    // assume sender used same origin and resolution as our map_origin and xy_resolution
-                    // note: hh is row index (height -> y), ww is column (width -> x)
-                    double world_x = map_origin(0) + (ww + 0.5) * xy_resolution;
-                    double world_y = map_origin(1) + (hh + 0.5) * xy_resolution;
-                    Eigen::Vector3d p(world_x, world_y, 0.0);
-                    Eigen::Vector3i id;
-                    posToIndex(p, id);
-                    if (!isInMap(id)) continue;
-
-                    // map message yaw index (yslice) -> internal yaw index
-                    int src_yaw = yslice;
-                    int src_bins = msg_yaw_bins;
-                    int dst_bins = vz;
-                    int mapped_yaw = 0;
-                    if (src_bins == dst_bins) {
-                        mapped_yaw = src_yaw;
-                    } else {
-                        // map proportional: floor(src_yaw * dst_bins / src_bins)
-                        mapped_yaw = static_cast<int>(std::floor((double)src_yaw * (double)dst_bins / (double)src_bins));
-                        if (mapped_yaw < 0) mapped_yaw = 0;
-                        if (mapped_yaw >= dst_bins) mapped_yaw = dst_bins - 1;
-                    }
-
-                    int addr = toAddress(id(0), id(1), mapped_yaw);
-                    if (addr < 0 || static_cast<size_t>(addr) >= occ_buffer.size()) continue;
-
-                    // Interpret fv as tipping probability in [0,1] or [0,100]
-                    bool is_occ = false;
-                    float v = fv;
-                    if (v > 1.5f) v = v / 100.0f; // convert 0-100 to 0-1
-                    if (v >= static_cast<float>(occ_threshold) / 100.0f) {
-                        is_occ = true;
-                    }
-
-                    if (is_occ) {
-                        occ_buffer[addr] = 1;
-                        // mark xy flag (OR across yaw slices)
-                        size_t xy_idx = static_cast<size_t>(id(0)) * static_cast<size_t>(vy) + static_cast<size_t>(id(1));
-                        if (xy_idx < xy_flags.size()) xy_flags[xy_idx] = 1;
-                    } else {
-                        occ_buffer[addr] = 0;
+                    const size_t src_addr =
+                        (static_cast<size_t>(y) *
+                             static_cast<size_t>(msg_w) +
+                         static_cast<size_t>(x)) *
+                            static_cast<size_t>(msg_yaw_bins) +
+                        static_cast<size_t>(src_yaw);
+                    const bool occupied =
+                        static_cast<double>(msg.data[src_addr]) >= threshold;
+                    const int dst_addr = toAddress(x, y, dst_yaw);
+                    decoded_occ[static_cast<size_t>(dst_addr)] =
+                        occupied ? 1 : 0;
+                    if (occupied)
+                    {
+                        ++occupied_voxel_count;
+                        xy_occupied = true;
                     }
                 }
+                const size_t xy_addr =
+                    static_cast<size_t>(x) * static_cast<size_t>(vy) +
+                    static_cast<size_t>(y);
+                decoded_occ_r2[xy_addr] = xy_occupied ? 1 : 0;
+                if (xy_occupied)
+                    ++occupied_xy_count;
             }
         }
+        return true;
+    }
 
-        // write back occ_r2_buffer from xy_flags
-        for (size_t i = 0; i < xy_flags.size() && i < occ_r2_buffer.size(); ++i) {
-            occ_r2_buffer[i] = xy_flags[i];
+    void UnevenMap::occMapCallback(
+        const std_msgs::Float32MultiArrayConstPtr& msg)
+    {
+        vector<char> decoded_occ;
+        vector<char> decoded_occ_r2;
+        size_t occupied_voxel_count = 0;
+        size_t occupied_xy_count = 0;
+        string error;
+        if (!decodeExternalOccupancy(
+                *msg, decoded_occ, decoded_occ_r2,
+                occupied_voxel_count, occupied_xy_count, error))
+        {
+            ROS_ERROR("Rejected external occupancy update: %s", error.c_str());
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(occ_mutex);
+            occ_buffer.swap(decoded_occ);
+            occ_r2_buffer.swap(decoded_occ_r2);
+        }
+        ROS_INFO(
+            "Applied external occupancy: %zu SE(2) voxels, %zu XY cells",
+            occupied_voxel_count, occupied_xy_count);
+    }
+
+    bool UnevenMap::replaceExternalMap(
+        const sensor_msgs::PointCloud2& cloud_msg,
+        const std_msgs::Float32MultiArray& occupancy_hwy,
+        double min_x,
+        double min_y,
+        double max_x,
+        double max_y,
+        double resolution,
+        size_t& point_count,
+        size_t& occupied_voxel_count,
+        size_t& occupied_xy_count,
+        string& error)
+    {
+        const double tolerance = 1e-6;
+        if (std::fabs(min_x - min_boundary(0)) > tolerance ||
+            std::fabs(min_y - min_boundary(1)) > tolerance ||
+            std::fabs(max_x - max_boundary(0)) > tolerance ||
+            std::fabs(max_y - max_boundary(1)) > tolerance ||
+            std::fabs(resolution - xy_resolution) > tolerance)
+        {
+            std::ostringstream oss;
+            oss << "map contract mismatch: expected bounds ["
+                << min_boundary(0) << "," << max_boundary(0) << "]x["
+                << min_boundary(1) << "," << max_boundary(1)
+                << "] at resolution " << xy_resolution;
+            error = oss.str();
+            return false;
+        }
+        if (!cloud_msg.header.frame_id.empty() &&
+            cloud_msg.header.frame_id != "map" &&
+            cloud_msg.header.frame_id != "world")
+        {
+            error = "pointcloud frame_id must be map or world";
+            return false;
         }
 
-        ROS_DEBUG("occMapCallback: applied Float32MultiArray occupancy grid with H=%d W=%d Y=%d (internal_vz=%d)", msg_h, msg_w, msg_yaw_bins, vz);
+        vector<char> decoded_occ;
+        vector<char> decoded_occ_r2;
+        if (!decodeExternalOccupancy(
+                occupancy_hwy, decoded_occ, decoded_occ_r2,
+                occupied_voxel_count, occupied_xy_count, error))
+        {
+            return false;
+        }
+
+        pcl::PointCloud<pcl::PointXYZ> input_cloud;
+        try
+        {
+            pcl::fromROSMsg(cloud_msg, input_cloud);
+        }
+        catch (const std::exception& exc)
+        {
+            error = string("failed to decode PointCloud2: ") + exc.what();
+            return false;
+        }
+        vector<int> finite_indices;
+        pcl::removeNaNFromPointCloud(
+            input_cloud, input_cloud, finite_indices);
+        if (input_cloud.empty())
+        {
+            error = "pointcloud contains no finite XYZ points";
+            return false;
+        }
+
+        const double box_r =
+            std::max(std::max(ellipsoid_x, ellipsoid_y), ellipsoid_z);
+        pcl::PointCloud<pcl::PointXYZ> clipped_cloud;
+        pcl::CropBox<pcl::PointXYZ> clipper;
+        clipper.setMin(Eigen::Vector4f(
+            static_cast<float>(min_x - box_r),
+            static_cast<float>(min_y - box_r),
+            std::numeric_limits<float>::lowest(), 1.0f));
+        clipper.setMax(Eigen::Vector4f(
+            static_cast<float>(max_x + box_r),
+            static_cast<float>(max_y + box_r),
+            std::numeric_limits<float>::max(), 1.0f));
+        clipper.setInputCloud(input_cloud.makeShared());
+        clipper.filter(clipped_cloud);
+        if (clipped_cloud.empty())
+        {
+            error = "pointcloud has no points inside map bounds plus padding";
+            return false;
+        }
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr new_world_cloud(
+            new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::VoxelGrid<pcl::PointXYZ> voxel_filter;
+        voxel_filter.setLeafSize(0.01f, 0.01f, 0.01f);
+        voxel_filter.setInputCloud(clipped_cloud.makeShared());
+        voxel_filter.filter(*new_world_cloud);
+        if (new_world_cloud->size() < 3)
+        {
+            error = "pointcloud has fewer than three filtered points";
+            return false;
+        }
+
+        pcl::PointCloud<pcl::PointXY>::Ptr new_world_cloud_plane(
+            new pcl::PointCloud<pcl::PointXY>());
+        new_world_cloud_plane->points.reserve(new_world_cloud->size());
+        for (size_t i = 0; i < new_world_cloud->points.size(); ++i)
+        {
+            pcl::PointXY point;
+            point.x = new_world_cloud->points[i].x;
+            point.y = new_world_cloud->points[i].y;
+            new_world_cloud_plane->points.emplace_back(point);
+        }
+        new_world_cloud->width = new_world_cloud->points.size();
+        new_world_cloud->height = 1;
+        new_world_cloud->is_dense = true;
+        new_world_cloud->header.frame_id = "world";
+        new_world_cloud_plane->width =
+            new_world_cloud_plane->points.size();
+        new_world_cloud_plane->height = 1;
+        new_world_cloud_plane->is_dense = true;
+        new_world_cloud_plane->header.frame_id = "world";
+
+        // ros::spin() serializes this service with planning callbacks. Mark
+        // the map unavailable before replacing live KD trees and buffers, and
+        // expose it only after both terrain and occupancy are complete.
+        map_ready = false;
+        world_cloud = new_world_cloud;
+        world_cloud_plane = new_world_cloud_plane;
+        kd_tree.setInputCloud(world_cloud);
+        kd_tree_plane.setInputCloud(world_cloud_plane);
+        const size_t buffer_size =
+            static_cast<size_t>(voxel_num(0)) *
+            static_cast<size_t>(voxel_num(1)) *
+            static_cast<size_t>(voxel_num(2));
+        map_buffer.assign(buffer_size, RXS2());
+        c_buffer.assign(buffer_size, 1.0);
+        if (!constructMap(false))
+        {
+            error = "failed to construct terrain map from pointcloud";
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(occ_mutex);
+            occ_buffer.swap(decoded_occ);
+            occ_r2_buffer.swap(decoded_occ_r2);
+        }
+
+        pcl::toROSMsg(*world_cloud, origin_cloud_msg);
+        origin_cloud_msg.header.frame_id = "world";
+        filtered_cloud_msg = sensor_msgs::PointCloud2();
+        filtered_cloud_msg.header.frame_id = "world";
+        zb_msg.points.clear();
+        so2_test_msg.markers.clear();
+        point_count = world_cloud->size();
+        map_ready = true;
+        return true;
     }
 
     bool UnevenMap::constructMapInput()
@@ -451,7 +668,7 @@ namespace uneven_planner
         return true;
     }
 
-    bool UnevenMap::constructMap()
+    bool UnevenMap::constructMap(bool persist_to_file)
     {
         const double box_r = max(max(ellipsoid_x, ellipsoid_y), ellipsoid_z);
         const Eigen::Vector3d ellipsoid_vecinv(1.0 / ellipsoid_x, 1.0 / ellipsoid_y, 1.0 / ellipsoid_z);
@@ -534,19 +751,26 @@ namespace uneven_planner
                         }
                     }
         
-        // to txt
-        ofstream outf;
-        outf.open(map_file, ofstream::out);
-        outf.clear();
-        for (int x=0; x<voxel_num[0]; x++)
-            for (int y=0; y<voxel_num[1]; y++)
-                for (int yaw=0; yaw<voxel_num[2]; yaw++)
-                {
-                    RXS2 rs2 = map_buffer[toAddress(x, y, yaw)];
-                    outf << x << "," << y << "," << yaw << "," << rs2.z << "," << rs2.sigma << "," \
-                         << rs2.zb.x() << "," << rs2.zb.y() <<endl;
-                }
-        outf.close();
+        if (persist_to_file && !map_file.empty())
+        {
+            ofstream outf;
+            outf.open(map_file, ofstream::out);
+            if (!outf.good())
+            {
+                ROS_ERROR("Failed to open terrain map file '%s' for writing",
+                          map_file.c_str());
+                return false;
+            }
+            for (int x=0; x<voxel_num[0]; x++)
+                for (int y=0; y<voxel_num[1]; y++)
+                    for (int yaw=0; yaw<voxel_num[2]; yaw++)
+                    {
+                        RXS2 rs2 = map_buffer[toAddress(x, y, yaw)];
+                        outf << x << "," << y << "," << yaw << ","
+                             << rs2.z << "," << rs2.sigma << ","
+                             << rs2.zb.x() << "," << rs2.zb.y() << endl;
+                    }
+        }
 
         ROS_INFO("map: SE(2) --> RXS2 done.");
 
