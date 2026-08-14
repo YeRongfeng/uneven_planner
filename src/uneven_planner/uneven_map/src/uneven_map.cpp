@@ -11,6 +11,13 @@ namespace uneven_planner
             mean_points+=points[i];
 
         mean_points /= (double)points.size();
+        rs2.z = mean_points.z();
+        if (points.size() < 3 || !mean_points.allFinite())
+        {
+            rs2.sigma = 1.0;
+            rs2.zb.setZero();
+            return rs2;
+        }
 
         Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
         for (size_t i=0; i<points.size(); i++)
@@ -29,13 +36,14 @@ namespace uneven_planner
         if (n(2, 0) < 0.0)
             n = -n;
         
-        rs2.sigma = D(evalsMax) / D.sum() * 3.0;
-        if (isnan(rs2.sigma))
+        const double eigenvalue_sum = D.sum();
+        rs2.sigma = D(evalsMax) / eigenvalue_sum * 3.0;
+        if (!std::isfinite(rs2.sigma) || !n.allFinite() ||
+            std::fabs(eigenvalue_sum) < 1e-12)
         {
             rs2.sigma = 1.0;
-            n = Eigen::Vector3d(1.0, 0.0, 0.0);
+            n = Eigen::Vector3d(0.0, 0.0, 1.0);
         }
-        rs2.z = mean_points.z();
         rs2.zb.x() = n(0, 0);
         rs2.zb.y() = n(1, 0);
 
@@ -694,6 +702,19 @@ namespace uneven_planner
                         RT.row(2) = zb;
                         Eigen::Vector3d world_pos(map_pos(0), map_pos(1), map_rs2.z);
                         world_pos.head(2) += xb.head(2) * 0.12;
+                        if (!RT.allFinite() || !world_pos.allFinite())
+                        {
+                            ROS_ERROR(
+                                "Non-finite terrain query at grid (%d,%d,%d), "
+                                "iteration %d; using conservative flat fallback",
+                                x, y, yaw, iter);
+                            RXS2 fallback;
+                            fallback.z = std::isfinite(map_rs2.z) ? map_rs2.z : 0.0;
+                            fallback.sigma = 1.0;
+                            map_buffer[toAddress(x, y, yaw)] = fallback;
+                            c_buffer[toAddress(x, y, yaw)] = 1.0;
+                            continue;
+                        }
                         
                         vector<int> Idxs;
                         vector<float> SquaredDists;

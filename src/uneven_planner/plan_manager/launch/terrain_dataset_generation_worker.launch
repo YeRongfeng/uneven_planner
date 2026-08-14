@@ -6,6 +6,7 @@
     <arg name="num_environments"/>
     <arg name="train_paths_per_env"/>
     <arg name="val_paths_per_env"/>
+    <arg name="stop_after_train"/>
     <arg name="dataset_dir"/>
     <arg name="start_env_id"/>
 
@@ -16,7 +17,13 @@
     <arg name="use_external_map"/>
     <arg name="external_map_path"/>
     <arg name="external_map_paths"/>
+    <arg name="train_external_map_paths"/>
+    <arg name="val_external_map_paths"/>
     <arg name="external_map_format"/>
+    <arg name="external_map_is_canonical"/>
+    <arg name="canonical_maps_per_environment"/>
+    <arg name="canonical_primary_scene_count"/>
+    <arg name="canonical_pool_start_env_id"/>
     <arg name="target_map_size"/>
     <arg name="target_resolution"/>
     <arg name="external_map_physical_size"/>
@@ -44,6 +51,7 @@
     <arg name="high_complexity_fraction"/>
     <arg name="map_ready_delay"/>
     <arg name="max_path_retries_before_regenerate"/>
+    <arg name="generation_random_seed"/>
     <arg name="map_pcd"/>
     <arg name="map_file"/>
 
@@ -58,7 +66,10 @@
                  value="$(eval -1 if int(arg('crop_random_seed')) &lt; 0 else int(arg('crop_random_seed')) + int(arg('worker_index')))"/>
             <arg name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
             <arg name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
+            <arg name="stop_after_train" value="$(arg stop_after_train)"/>
             <arg name="dataset_dir" value="$(arg dataset_dir)"/>
+            <arg name="experiment_manifest_name"
+                 value="$(eval 'experiment_manifest_worker_' + str(arg('worker_index')) + '.json')"/>
             <arg name="map_size" value="$(arg map_size)"/>
             <arg name="map_resolution" value="$(arg map_resolution)"/>
             <arg name="max_height" value="$(arg max_height)"/>
@@ -66,7 +77,15 @@
             <arg name="use_external_map" value="$(arg use_external_map)"/>
             <arg name="external_map_path" value="$(arg external_map_path)"/>
             <arg name="external_map_paths" value="$(arg external_map_paths)"/>
+            <arg name="train_external_map_paths" value="$(arg train_external_map_paths)"/>
+            <arg name="val_external_map_paths" value="$(arg val_external_map_paths)"/>
             <arg name="external_map_format" value="$(arg external_map_format)"/>
+            <arg name="external_map_is_canonical" value="$(arg external_map_is_canonical)"/>
+            <arg name="canonical_maps_per_environment" value="$(arg canonical_maps_per_environment)"/>
+            <arg name="canonical_primary_scene_count"
+                 value="$(eval int(arg('num_environments')) if int(arg('canonical_primary_scene_count')) &lt;= 0 else int(arg('canonical_primary_scene_count')))"/>
+            <arg name="canonical_pool_start_env_id"
+                 value="$(eval int(arg('start_env_id')) if int(arg('canonical_pool_start_env_id')) &lt; 0 else int(arg('canonical_pool_start_env_id')))"/>
             <arg name="target_map_size" value="$(arg target_map_size)"/>
             <arg name="target_resolution" value="$(arg target_resolution)"/>
             <arg name="external_map_physical_size" value="$(arg external_map_physical_size)"/>
@@ -92,6 +111,8 @@
             <arg name="high_complexity_fraction" value="$(arg high_complexity_fraction)"/>
             <arg name="map_ready_delay" value="$(arg map_ready_delay)"/>
             <arg name="max_path_retries_before_regenerate" value="$(arg max_path_retries_before_regenerate)"/>
+            <arg name="generation_random_seed"
+                 value="$(eval -1 if int(arg('generation_random_seed')) &lt; 0 else int(arg('generation_random_seed')) + int(arg('worker_index')))"/>
             <arg name="map_pcd" value="$(arg map_pcd)"/>
             <arg name="map_file" value="$(arg map_file)"/>
             <arg name="enable_standalone_uneven_map" value="false"/>

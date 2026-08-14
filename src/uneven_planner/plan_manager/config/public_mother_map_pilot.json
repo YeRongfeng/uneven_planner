@@ -1,0 +1,113 @@
+{
+  "manifest_version": "public-mother-map-pilot-v1",
+  "created_date": "2026-08-13",
+  "policy": "terrain20m-v2",
+  "contract": {
+    "patch_size_m": 20.0,
+    "grid_resolution_m": 0.2,
+    "planner_surface_resolution_m": 0.05,
+    "source_profile": "als",
+    "point_classes": [2],
+    "fit_radius_m": 0.9,
+    "min_neighbors": 5,
+    "max_local_fit_rmse_m": 0.12,
+    "min_source_density_points_per_m2": 4.0,
+    "support_resolution_m": 1.0,
+    "min_support_coverage": 0.97,
+    "min_center_separation_m": 20.0
+  },
+  "sources": [
+    {
+      "domain": "desert",
+      "site_id": "NM10_Kocurek",
+      "title": "White Sands National Monument, NM: Lidar Survey of Dune Fields",
+      "doi": "https://doi.org/10.5069/G97D2S2D",
+      "license": "CC BY 4.0",
+      "crs": "EPSG:26913+5703",
+      "tile": "NM10_Kocurek/ot_381000_3632000.laz",
+      "local_file": "dataset/external/white_sands_nm10/raw/ot_381000_3632000_smrf.laz",
+      "seed": 20260813,
+      "attempts": 3,
+      "accepted": 3,
+      "grades": {"easy": 1, "medium": 2, "hard": 0},
+      "status": "candidate",
+      "preprocessing": {
+        "method": "PDAL 2.8.4 assign + statistical outlier + SMRF",
+        "smrf": {"cell": 1.0, "scalar": 1.25, "slope": 0.15, "threshold": 0.5, "window": 18.0, "returns": "last,only"}
+      }
+    },
+    {
+      "domain": "forest",
+      "site_id": "WA21_Lumbrazo",
+      "title": "Hydrologic Effects of Forest Restoration, WA 2021",
+      "landing_page": "https://portal.opentopography.org/lidarDataset?opentopoID=OTLAS.122021.6339.1",
+      "license": "CC BY 4.0",
+      "crs": "EPSG:6339",
+      "tile": "WA21_Lumbrazo/642000_5265000.laz",
+      "local_file": "dataset/external/forest_wa21/raw/642000_5265000.laz",
+      "seed": 20260821,
+      "attempts": 15,
+      "accepted": 3,
+      "grades": {"easy": 1, "medium": 2, "hard": 0},
+      "status": "candidate_low_yield"
+    },
+    {
+      "domain": "hill",
+      "site_id": "CO10_Tucker",
+      "title": "Raleigh Peak, Colorado: May 2010",
+      "doi": "https://doi.org/10.5069/G9TM782F",
+      "license": "CC BY 4.0",
+      "crs": "EPSG:26913+5703",
+      "tile": "CO10_Tucker/ot_480000_4354000.laz",
+      "local_file": "dataset/external/hill_co10/raw/ot_480000_4354000.laz",
+      "seed": 20260828,
+      "attempts": 18,
+      "accepted": 3,
+      "grades": {"easy": 0, "medium": 3, "hard": 0},
+      "status": "candidate_low_yield"
+    },
+    {
+      "domain": "snow",
+      "site_id": "BCZO_SnowOn09",
+      "title": "Boulder Creek CZO May 9 2010 Snow-On Lidar Survey",
+      "doi": "https://doi.org/10.5069/G9Z31WKD",
+      "license": "CC BY 4.0",
+      "crs": "EPSG:26913+5703",
+      "tile": "BCZO_SnowOn09/ot_440000_4420000.laz",
+      "local_file": "dataset/external/snow_bczo/raw/ot_440000_4420000.laz",
+      "seed": 20260824,
+      "attempts": 14,
+      "accepted": 3,
+      "grades": {"easy": 1, "medium": 1, "hard": 1},
+      "status": "candidate_low_yield"
+    },
+    {
+      "domain": "volcano",
+      "site_id": "CA16_Martens",
+      "title": "Inyo Domes, CA lidar 2016",
+      "doi": "https://doi.org/10.5069/G98913TW",
+      "license": "CC BY 4.0",
+      "crs": "EPSG:26911+5703",
+      "tile": "CA16_Martens/ot_C321000_4174000.laz",
+      "local_file": "dataset/external/volcano_ca16/raw/ot_C321000_4174000.laz",
+      "seed": 20260826,
+      "attempts": 5,
+      "accepted": 3,
+      "grades": {"easy": 1, "medium": 1, "hard": 1},
+      "status": "candidate"
+    }
+  ],
+  "stage_c": {
+    "paths_per_scene": 2,
+    "max_attempts_per_path": 5,
+    "maps_completed": 15,
+    "maps_total": 15,
+    "paths_saved": 30,
+    "paths_requested": 30,
+    "summary_file": "dataset/tests/public_mother_maps_stage_c_20260813/summary.json"
+  },
+  "production_readiness": {
+    "status": "blocked_on_independent_validation_sites",
+    "reason": "Each domain currently has one accepted survey site; crop-level splitting would leak site geometry across train and validation."
+  }
+}

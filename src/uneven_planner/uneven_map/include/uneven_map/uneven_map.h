@@ -50,8 +50,14 @@ namespace uneven_planner
         
         RXS2(): z(0.0), sigma(0.0), zb(Eigen::Vector2d::Zero()) {}
         RXS2(double z_, double sigma_, Eigen::Vector2d zb_): z(z_), sigma(sigma_), zb(zb_) {} 
-        inline double getC() { return sqrt(1.0 - zb(0)*zb(0) - zb(1)*zb(1)); }
-        inline double getCosXi() { return sqrt(1.0 - zb(0)*zb(0) - zb(1)*zb(1)); }
+        inline double getC()
+        {
+            return sqrt(std::max(0.0, 1.0 - zb.squaredNorm()));
+        }
+        inline double getCosXi()
+        {
+            return sqrt(std::max(0.0, 1.0 - zb.squaredNorm()));
+        }
         inline RXS2 operator+(const RXS2& a)
         {
             return RXS2(z+a.z, sigma+a.sigma, zb+a.zb);

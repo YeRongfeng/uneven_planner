@@ -4,8 +4,10 @@
     <arg name="num_environments" default="50" doc="要生成的环境数量"/>
     <arg name="train_paths_per_env" default="200" doc="每个环境的训练路径数量"/>
     <arg name="val_paths_per_env" default="20" doc="每个环境的验证路径数量"/>
+    <arg name="stop_after_train" default="false" doc="train完成后结束；用于逐地图Stage-C校准"/>
     <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset20" doc="数据集输出目录"/>
     <arg name="start_env_id" default="50" doc="起始环境ID"/>
+    <arg name="experiment_manifest_name" default="experiment_manifest.json" doc="本生成进程的实验记录文件名；并行worker必须各自独立"/>
     
     <!-- 地形生成参数 -->
     <arg name="map_size" default="20.0" doc="地图尺寸（米）"/>
@@ -17,7 +19,13 @@
     <arg name="use_external_map" default="true" doc="是否使用外部地图文件"/>
     <arg name="external_map_path" default="$(find uneven_map)/maps/map_my.pcd" doc="兼容旧调用的单个外部地图路径"/>
     <arg name="external_map_paths" default="" doc="逗号分隔的外部地图列表；为空时兼容使用external_map_path"/>
+    <arg name="train_external_map_paths" default="" doc="train专用canonical地图列表；与val列表同时使用"/>
+    <arg name="val_external_map_paths" default="" doc="val专用canonical地图列表；与train列表同时使用"/>
     <arg name="external_map_format" default="pcd" doc="外部地图格式：pcd、ply、txt、heightmap"/>
+    <arg name="external_map_is_canonical" default="false" doc="地图已严格满足目标米制栅格契约；跳过缩放、旋转和随机裁剪"/>
+    <arg name="canonical_maps_per_environment" default="1" doc="每个split为每个环境准备的canonical候选数，含首选地图"/>
+    <arg name="canonical_primary_scene_count" default="-1" doc="canonical池每轮跨度；负数使用本进程环境数"/>
+    <arg name="canonical_pool_start_env_id" default="-1" doc="canonical池对应的全局起始环境ID；负数使用本进程start_env_id"/>
     <arg name="target_map_size" default="20.0" doc="旋转裁剪后的目标地图尺寸（米）"/>
     <arg name="target_resolution" default="0.2" doc="目标栅格分辨率（米），20/0.2=100"/>
     <arg name="external_map_physical_size" default="0.0" doc="原始点云横向物理尺寸（米）；0表示源坐标已经是米，不缩放"/>
@@ -48,6 +56,7 @@
     <arg name="high_complexity_fraction" default="0.4" doc="高朝向难度轨迹比例"/>
     <arg name="map_ready_delay" default="1.0" doc="发布新地图后开始规划前的非阻塞等待时间（秒）"/>
     <arg name="max_path_retries_before_regenerate" default="30" doc="单条路径连续失败多少次后重新裁剪当前环境；小于等于0表示禁用"/>
+    <arg name="generation_random_seed" default="-1" doc="轨迹/地形随机种子；-1表示非确定性"/>
     
     <!-- 地图文件参数 -->
     <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd" doc="PCD地图文件路径"/>
@@ -111,13 +120,15 @@
     </node>
     
     <!-- 启动地形数据集生成器 -->
-    <node name="terrain_dataset_generator" pkg="plan_manager" type="terrain_dataset_generator.py" output="screen" required="false" launch-prefix="python3.10">
+    <node name="terrain_dataset_generator" pkg="plan_manager" type="terrain_dataset_generator.py" output="screen" required="false" launch-prefix="python3.8">
         <!-- 数据集参数 -->
         <param name="num_environments" value="$(arg num_environments)"/>
         <param name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
         <param name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
+        <param name="stop_after_train" value="$(arg stop_after_train)"/>
         <param name="dataset_dir" value="$(arg dataset_dir)"/>
         <param name="start_env_id" value="$(arg start_env_id)"/>
+        <param name="experiment_manifest_name" value="$(arg experiment_manifest_name)"/>
         
         <!-- 地形生成参数 -->
         <param name="map_size" value="$(arg map_size)"/>
@@ -129,7 +140,13 @@
         <param name="use_external_map" value="$(arg use_external_map)"/>
         <param name="external_map_path" value="$(arg external_map_path)"/>
         <param name="external_map_paths" value="$(arg external_map_paths)"/>
+        <param name="train_external_map_paths" value="$(arg train_external_map_paths)"/>
+        <param name="val_external_map_paths" value="$(arg val_external_map_paths)"/>
         <param name="external_map_format" value="$(arg external_map_format)"/>
+        <param name="external_map_is_canonical" value="$(arg external_map_is_canonical)"/>
+        <param name="canonical_maps_per_environment" value="$(arg canonical_maps_per_environment)"/>
+        <param name="canonical_primary_scene_count" value="$(eval int(arg('num_environments')) if int(arg('canonical_primary_scene_count')) &lt;= 0 else int(arg('canonical_primary_scene_count')))"/>
+        <param name="canonical_pool_start_env_id" value="$(eval int(arg('start_env_id')) if int(arg('canonical_pool_start_env_id')) &lt; 0 else int(arg('canonical_pool_start_env_id')))"/>
         <param name="target_map_size" value="$(arg target_map_size)"/>
         <param name="target_resolution" value="$(arg target_resolution)"/>
         <param name="external_map_physical_size" value="$(arg external_map_physical_size)"/>
@@ -160,6 +177,7 @@
         <param name="high_complexity_fraction" value="$(arg high_complexity_fraction)"/>
         <param name="map_ready_delay" value="$(arg map_ready_delay)"/>
         <param name="max_path_retries_before_regenerate" value="$(arg max_path_retries_before_regenerate)"/>
+        <param name="generation_random_seed" value="$(arg generation_random_seed)"/>
         <param name="planner_connection_timeout" value="60.0"/>
         
         <!-- 地图更新超时时间 -->

@@ -1,0 +1,107 @@
+{
+  "manifest_version": "public-mother-map-release-candidate-v1",
+  "created_date": "2026-08-13",
+  "policy": "terrain20m-v2",
+  "requested_dataset": {
+    "domains": ["desert", "forest", "hill", "snow", "volcano"],
+    "train_scenes_per_domain": 100,
+    "val_scenes_per_domain": 100,
+    "train_paths_per_scene": 100,
+    "val_paths_per_scene": 10,
+    "canonical_candidates_per_scene": 2,
+    "maximum_sampling_attempts_per_split": 6000
+  },
+  "sampling": {
+    "center_method": "uniform occupied 1 m source-support cell with within-cell jitter",
+    "crop_yaw_degrees": [-180.0, 180.0],
+    "minimum_center_separation_m": 20.0,
+    "accepted_grades": ["easy", "medium", "hard"],
+    "source_profile": "als",
+    "point_classes": [2],
+    "fit_radius_m": 0.9,
+    "minimum_neighbors": 5,
+    "minimum_source_density_points_per_m2": 4.0,
+    "source_support_resolution_m": 1.0,
+    "minimum_source_support_fraction": 0.97,
+    "output_grid_resolution_m": 0.2,
+    "planner_surface_resolution_m": 0.05
+  },
+  "splits": [
+    {
+      "domain": "desert",
+      "train": {"site_id": "NM10_Kocurek", "tile": "ot_381000_3632000_smrf.laz", "seed": 20260901},
+      "val": {"site_id": "CA22_Marvin", "tile": "710000_3755000.laz", "seed": 20260902}
+    },
+    {
+      "domain": "forest",
+      "train": {"site_id": "WA21_Lumbrazo", "tile": "642000_5265000.laz", "seed": 20260902},
+      "val": {"site_id": "AZ17_Donager", "tile": "C429000_3888000.laz", "seed": 20260903}
+    },
+    {
+      "domain": "hill",
+      "train": {"site_id": "CO10_Tucker", "tile": "ot_480000_4354000.laz", "seed": 20260903},
+      "val": {"site_id": "CA13_Johnstone", "tile": "ot_677000_4007000_1.laz", "seed": 20260904}
+    },
+    {
+      "domain": "snow",
+      "train": {"site_id": "BCZO_SnowOn09", "tile": "ot_440000_4420000.laz", "seed": 20260904},
+      "val": {"site_id": "CA22_Piske", "tile": "731000_4366000.laz", "seed": 20260905}
+    },
+    {
+      "domain": "volcano",
+      "train": {"site_id": "CA16_Martens", "tile": "ot_C321000_4174000.laz", "seed": 20260905},
+      "val": {"site_id": "CA19_Herbst", "tile": "624000_4488000.laz", "seed": 20260906}
+    }
+  ],
+  "scale20_results": [
+    {"split": "train", "domain": "desert", "accepted": 20, "attempts": 24, "grades": {"easy": 14, "medium": 5, "hard": 1}},
+    {"split": "train", "domain": "forest", "accepted": 20, "attempts": 325, "grades": {"easy": 6, "medium": 12, "hard": 2}},
+    {"split": "train", "domain": "hill", "accepted": 20, "attempts": 166, "grades": {"easy": 0, "medium": 13, "hard": 7}},
+    {"split": "train", "domain": "snow", "accepted": 20, "attempts": 118, "grades": {"easy": 8, "medium": 10, "hard": 2}},
+    {"split": "train", "domain": "volcano", "accepted": 20, "attempts": 49, "grades": {"easy": 3, "medium": 17, "hard": 0}},
+    {"split": "val", "domain": "desert", "accepted": 20, "attempts": 22, "grades": {"easy": 12, "medium": 8, "hard": 0}},
+    {"split": "val", "domain": "forest", "accepted": 20, "attempts": 66, "grades": {"easy": 17, "medium": 3, "hard": 0}},
+    {"split": "val", "domain": "hill", "accepted": 20, "attempts": 41, "grades": {"easy": 13, "medium": 6, "hard": 1}},
+    {"split": "val", "domain": "snow", "accepted": 20, "attempts": 239, "grades": {"easy": 2, "medium": 18, "hard": 0}},
+    {"split": "val", "domain": "volcano", "accepted": 20, "attempts": 58, "grades": {"easy": 0, "medium": 4, "hard": 16}}
+  ],
+  "stage_c": {
+    "independent_validation_maps_completed": 15,
+    "independent_validation_maps_total": 15,
+    "paths_saved": 30,
+    "paths_requested": 30,
+    "summary_file": "dataset/tests/independent_val_stage_c_20260813/summary.json"
+  },
+  "end_to_end_release_test": {
+    "domain": "forest",
+    "train_scenes": 1,
+    "val_scenes": 1,
+    "train_paths": 2,
+    "val_paths": 1,
+    "trajectory_points_per_path": 100,
+    "train_site_id": "WA21_Lumbrazo",
+    "val_site_id": "AZ17_Donager",
+    "status": "passed",
+    "output": "dataset/tests/release_pipeline_e2e_forest_absfix2_20260813/forest"
+  },
+  "parallel_release_test": {
+    "domain": "forest",
+    "workers": 8,
+    "train_scenes": 8,
+    "val_scenes": 8,
+    "train_paths": 8,
+    "val_paths": 8,
+    "worker_manifests_completed": 8,
+    "environment_ids": [0, 1, 2, 3, 4, 5, 6, 7],
+    "minimum_train_valid_fraction": 0.9856,
+    "minimum_val_valid_fraction": 0.9702,
+    "status": "passed",
+    "output": "dataset/tests/release_pipeline_parallel8_forest_20260813/forest"
+  },
+  "release_requirements": {
+    "rotate_valid_mask_with_map_and_trajectory": true,
+    "mask_invalid_cells_in_training_loss_and_features": true,
+    "fixed_deterministic_validation_transform": true,
+    "full_run_status": "ready"
+  }
+}

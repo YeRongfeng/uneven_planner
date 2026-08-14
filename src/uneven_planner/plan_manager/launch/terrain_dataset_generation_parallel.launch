@@ -8,6 +8,7 @@
     <arg name="num_environments" default="30"/>
     <arg name="train_paths_per_env" default="200"/>
     <arg name="val_paths_per_env" default="20"/>
+    <arg name="stop_after_train" default="false"/>
     <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset1_val"/>
     <arg name="start_env_id" default="20"/>
 
@@ -19,7 +20,13 @@
     <arg name="use_external_map" default="true"/>
     <arg name="external_map_path" default="$(find uneven_map)/maps/map_my.pcd"/>
     <arg name="external_map_paths" default="$(find uneven_map)/maps/map_my.pcd,$(find uneven_map)/maps/desert.pcd,$(find uneven_map)/maps/forest.pcd,$(find uneven_map)/maps/hill.pcd,$(find uneven_map)/maps/mountain.pcd,$(find uneven_map)/maps/vocano.pcd"/>
+    <arg name="train_external_map_paths" default=""/>
+    <arg name="val_external_map_paths" default=""/>
     <arg name="external_map_format" default="pcd"/>
+    <arg name="external_map_is_canonical" default="false"/>
+    <arg name="canonical_maps_per_environment" default="1"/>
+    <arg name="canonical_primary_scene_count" default="-1"/>
+    <arg name="canonical_pool_start_env_id" default="-1"/>
     <arg name="target_map_size" default="20.0"/>
     <arg name="target_resolution" default="0.2"/>
     <arg name="external_map_physical_size" default="0.0"/>
@@ -47,6 +54,7 @@
     <arg name="high_complexity_fraction" default="0.4"/>
     <arg name="map_ready_delay" default="1.0"/>
     <arg name="max_path_retries_before_regenerate" default="30"/>
+    <arg name="generation_random_seed" default="-1"/>
     <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd"/>
     <arg name="map_file" default=""/>
 

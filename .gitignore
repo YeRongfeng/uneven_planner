@@ -5,6 +5,7 @@ build/
 devel/
 dataset/
 .vscode/
+.conda/
 src/uneven_planner/plan_manager/datasets/
 src/uneven_planner/plan_manager/data/
 src/uneven_planner/uneven_planner.zip

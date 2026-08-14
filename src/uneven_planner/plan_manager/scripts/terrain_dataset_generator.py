@@ -43,11 +43,20 @@ matplotlib.use('Agg')  # 设置非交互式后端，避免线程问题
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # 添加3D绘图支持
 import open3d as o3d
-import noise
+try:
+    import noise
+except ImportError:
+    # External-map dataset generation does not use Perlin noise.  Keep that
+    # workflow available on ROS/Python installations where the optional
+    # ``noise`` package is not installed.
+    noise = None
 import random
 import math
 import time
 import os
+import sys
+import json
+import datetime
 import pickle
 import glob
 import cv2
@@ -588,6 +597,10 @@ class TerrainGenerator:
     """
     
     def __init__(self, map_size=10.0, resolution=0.02, max_height=3.0, min_height=0.0):
+        if noise is None:
+            raise ImportError(
+                "The optional 'noise' package is required for synthetic "
+                "terrain generation, but not for external-map datasets")
         """
         初始化地形生成器
         
@@ -1450,6 +1463,8 @@ class TerrainDatasetGenerator:
         self.num_environments = rospy.get_param('~num_environments', 1000)
         self.train_paths_per_env = rospy.get_param('~train_paths_per_env', 50)
         self.val_paths_per_env = rospy.get_param('~val_paths_per_env', 5)
+        self.stop_after_train = bool(
+            rospy.get_param('~stop_after_train', False))
         self.dataset_dir = rospy.get_param('~dataset_dir', 'dataset')
         self.start_env_id = rospy.get_param('~start_env_id', 0)
         
@@ -1470,8 +1485,52 @@ class TerrainDatasetGenerator:
             self.external_map_paths = [self.external_map_path]
         if self.external_map_paths:
             self.external_map_path = self.external_map_paths[0]
+        self.train_external_map_paths = self._parse_map_paths(
+            rospy.get_param('~train_external_map_paths', []))
+        self.val_external_map_paths = self._parse_map_paths(
+            rospy.get_param('~val_external_map_paths', []))
+        self.has_split_map_pools = bool(
+            self.train_external_map_paths or self.val_external_map_paths)
+        if self.has_split_map_pools:
+            if (not self.train_external_map_paths or
+                    not self.val_external_map_paths):
+                raise ValueError(
+                    "train_external_map_paths and val_external_map_paths "
+                    "must both be provided")
+            self.external_map_paths = list(dict.fromkeys(
+                self.train_external_map_paths + self.val_external_map_paths))
+            self.external_map_path = self.train_external_map_paths[0]
+        else:
+            self.train_external_map_paths = self.external_map_paths
+            self.val_external_map_paths = self.external_map_paths
         self.current_external_map_index = None
         self.external_map_format = rospy.get_param('~external_map_format', 'pcd')  # 支持 'pcd', 'ply', 'txt', 'heightmap'
+        self.external_map_is_canonical = bool(
+            rospy.get_param('~external_map_is_canonical', False))
+        self.canonical_maps_per_environment = int(
+            rospy.get_param('~canonical_maps_per_environment', 1))
+        if self.canonical_maps_per_environment <= 0:
+            raise ValueError(
+                "canonical_maps_per_environment must be positive")
+        self.canonical_primary_scene_count = int(rospy.get_param(
+            '~canonical_primary_scene_count', self.num_environments))
+        self.canonical_pool_start_env_id = int(rospy.get_param(
+            '~canonical_pool_start_env_id', self.start_env_id))
+        if self.canonical_primary_scene_count <= 0:
+            raise ValueError("canonical_primary_scene_count must be positive")
+        self.canonical_replacement_round = {}
+        self.canonical_map_rejections = []
+        if self.external_map_is_canonical and self.has_split_map_pools:
+            expected_pool_size = (
+                self.canonical_primary_scene_count
+                * self.canonical_maps_per_environment)
+            for split_name, split_paths in (
+                    ('train', self.train_external_map_paths),
+                    ('val', self.val_external_map_paths)):
+                if len(split_paths) < expected_pool_size:
+                    raise ValueError(
+                        f"{split_name} canonical pool has {len(split_paths)} "
+                        f"maps; expected at least {expected_pool_size}")
         self.target_map_size = float(rospy.get_param('~target_map_size', 20.0))
         self.target_resolution = float(rospy.get_param('~target_resolution', 0.2))
         self.external_map_fixed_yaw_deg = float(
@@ -1496,6 +1555,7 @@ class TerrainDatasetGenerator:
             None if self.crop_random_seed < 0 else self.crop_random_seed)
         self.current_crop_info = None
         self.current_source_transform = None
+        self.current_canonical_grid = None
         # 每个worker对每个源地图只读取并规范化一次。后续环境以及地图重生成
         # 都只执行随机裁剪，避免反复加载点云。
         self.cached_external_source_maps = {}
@@ -1546,6 +1606,12 @@ class TerrainDatasetGenerator:
         self.map_y_max = self.map_size / 2 - 1.0
         self.min_distance = rospy.get_param('~min_distance', 2.0)
         self.publish_delay = rospy.get_param('~publish_delay', 0.1)
+        self.generation_random_seed = int(
+            rospy.get_param('~generation_random_seed', -1))
+        if self.generation_random_seed >= 0:
+            random.seed(self.generation_random_seed)
+            np.random.seed(self.generation_random_seed)
+            torch.manual_seed(self.generation_random_seed)
         self.prefilter_stable_poses = bool(
             rospy.get_param('~prefilter_stable_poses', True))
         # 保存前的最终验收严格复用 MPT 当前 stability contract。它与
@@ -1637,6 +1703,8 @@ class TerrainDatasetGenerator:
             'empty_trajectory': 0,
             'watchdog_timeout': 0,
             'environment_regenerated': 0,
+            'canonical_map_rejected': 0,
+            'canonical_map_replaced': 0,
         }
         self.map_update_request_id = 0
         self.current_planner_map_version = None
@@ -1651,6 +1719,20 @@ class TerrainDatasetGenerator:
         self.val_dir = os.path.join(self.dataset_dir, 'val')
         os.makedirs(self.train_dir, exist_ok=True)
         os.makedirs(self.val_dir, exist_ok=True)
+        experiment_manifest_name = str(rospy.get_param(
+            '~experiment_manifest_name', 'experiment_manifest.json')).strip()
+        if (not experiment_manifest_name or
+                os.path.basename(experiment_manifest_name) != experiment_manifest_name):
+            raise ValueError(
+                "experiment_manifest_name must be a non-empty filename")
+        self.experiment_manifest_path = os.path.join(
+            self.dataset_dir, experiment_manifest_name)
+        self.experiment_started_utc = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+        self.experiment_status = 'initialized'
+        self.attempt_records = []
+        self.active_attempt_record = None
+        self.map_application_records = []
         
         # 初始化组件
         if not self.use_external_map:
@@ -1690,6 +1772,8 @@ class TerrainDatasetGenerator:
         self.traj_sub = rospy.Subscriber('data_generate_node/optimized_traj', SE2Traj, self.trajectory_callback)
         self.result_sub = rospy.Subscriber('data_generate_node/planning_result', Bool, self.planning_result_callback)
         self.map_regen_sub = rospy.Subscriber('data_generate_node/map_regeneration_request', Bool, self.map_regeneration_callback)
+        self.write_experiment_manifest()
+        rospy.on_shutdown(self.finalize_experiment_manifest)
         
         rospy.loginfo(f"TerrainDatasetGenerator initialized:")
         rospy.loginfo(f"  - num_environments: {self.num_environments}")
@@ -1698,8 +1782,10 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"  - dataset_dir: {self.dataset_dir}")
         rospy.loginfo(f"  - start_env_id: {self.start_env_id}")
         if self.use_external_map:
+            map_mode = ('canonical audited maps' if self.external_map_is_canonical
+                        else 'random external crops')
             rospy.loginfo(
-                f"  - random external crop: {self.target_map_size:.2f}m x "
+                f"  - {map_mode}: {self.target_map_size:.2f}m x "
                 f"{self.target_map_size:.2f}m, {self.target_resolution:.3f}m/cell, "
                 f"{int(round(target_cells))}x{int(round(target_cells))}")
         
@@ -1714,6 +1800,110 @@ class TerrainDatasetGenerator:
         #     rospy.loginfo("start_data_generation called: success=%s msg=%s", resp.success, resp.message)
         # except Exception as e:
         #     rospy.logerr("Failed to call /start_data_generation: %s", e)
+
+    @staticmethod
+    def _parse_map_paths(configured_paths):
+        if isinstance(configured_paths, str):
+            configured_paths = configured_paths.replace(';', ',').split(',')
+        elif not isinstance(configured_paths, (list, tuple)):
+            raise ValueError(
+                "map paths must be a list or comma-separated string")
+        return list(dict.fromkeys(
+            str(path).strip() for path in configured_paths
+            if str(path).strip()))
+
+    @staticmethod
+    def _file_record(path):
+        """Record local file provenance without reading the full file."""
+        absolute = os.path.abspath(path)
+        if not os.path.isfile(absolute):
+            return {'path': absolute, 'missing': True}
+        stat = os.stat(absolute)
+        return {
+            'path': absolute,
+            'size_bytes': int(stat.st_size),
+            'mtime_ns': int(stat.st_mtime_ns),
+        }
+
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, dict):
+            return {str(key): TerrainDatasetGenerator._json_safe(item)
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [TerrainDatasetGenerator._json_safe(item)
+                    for item in value]
+        if isinstance(value, np.generic):
+            return value.item()
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return repr(value)
+
+    def _ros_parameter_snapshot(self):
+        snapshot = {}
+        relevant_prefixes = (
+            rospy.get_name() + '/', '/uneven_map/', '/alm_traj_opt/',
+            '/kino_astar/', '/manager/', '/only_planner/')
+        for name in sorted(rospy.get_param_names()):
+            if name == rospy.get_name() or name.startswith(relevant_prefixes):
+                try:
+                    snapshot[name] = self._json_safe(rospy.get_param(name))
+                except (KeyError, rospy.ROSException) as exc:
+                    snapshot[name] = {'read_error': str(exc)}
+        return snapshot
+
+    def write_experiment_manifest(self):
+        """Atomically persist parameters and outcomes throughout the run."""
+        source_maps = [
+            self._file_record(path) for path in self.external_map_paths]
+        path_files = sorted(glob.glob(os.path.join(
+            self.dataset_dir, '*', 'env*', 'path_*.p')))
+        map_files = sorted(glob.glob(os.path.join(
+            self.dataset_dir, '*', 'env*', 'map.p')))
+        manifest = {
+            'schema_version': 'terrain-planner-experiment-v2',
+            'status': self.experiment_status,
+            'started_utc': self.experiment_started_utc,
+            'updated_utc': datetime.datetime.now(
+                datetime.timezone.utc).isoformat(),
+            'node_name': rospy.get_name(),
+            'python_version': sys.version,
+            'dependency_versions': {
+                'numpy': np.__version__,
+                'open3d': getattr(o3d, '__version__', 'unknown'),
+                'torch': getattr(torch, '__version__', 'unknown'),
+                'opencv': getattr(cv2, '__version__', 'unknown'),
+            },
+            'implementation_file': os.path.abspath(__file__),
+            'source_maps': source_maps,
+            'ros_parameters': self._ros_parameter_snapshot(),
+            'attempts': self.attempt_records,
+            'map_applications': self.map_application_records,
+            'canonical_map_rejections': self.canonical_map_rejections,
+            'retry_statistics': dict(self.retry_statistics),
+            'outputs': {
+                'maps': len(map_files),
+                'paths': len(path_files),
+                'train_paths': len([p for p in path_files
+                                    if os.sep + 'train' + os.sep in p]),
+                'val_paths': len([p for p in path_files
+                                  if os.sep + 'val' + os.sep in p]),
+            },
+        }
+        temporary = self.experiment_manifest_path + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as stream:
+            json.dump(self._json_safe(manifest), stream, indent=2,
+                      ensure_ascii=False, sort_keys=True)
+            stream.write('\n')
+        os.replace(temporary, self.experiment_manifest_path)
+
+    def finalize_experiment_manifest(self):
+        if self.experiment_status in ('initialized', 'running'):
+            self.experiment_status = 'interrupted'
+        try:
+            self.write_experiment_manifest()
+        except Exception as exc:
+            rospy.logerr("Failed to finalize experiment manifest: %s", exc)
     
     def pointcloud_to_ros_message(self, pcd):
         """将Open3D点云转换为ROS PointCloud2消息"""
@@ -1739,13 +1929,30 @@ class TerrainDatasetGenerator:
         return ros_pointcloud
 
     def select_external_map_path(self):
-        """为当前环境/split确定性轮换源地图，并让val避开同index的train源。"""
-        source_count = len(self.external_map_paths)
-        source_index = self.current_env_id % source_count
-        if self.current_phase == 'val' and source_count > 1:
-            source_index = (source_index + 1) % source_count
+        """从当前 split 的地图池中确定性轮换 canonical 场景。"""
+        phase_paths = (self.train_external_map_paths
+                       if self.current_phase == 'train'
+                       else self.val_external_map_paths)
+        source_count = len(phase_paths)
+        if self.external_map_is_canonical and self.has_split_map_pools:
+            local_environment = (
+                self.current_env_id - self.canonical_pool_start_env_id)
+            replacement_round = self.canonical_replacement_round.get(
+                (self.current_phase, self.current_env_id), 0)
+            source_index = (
+                local_environment
+                + replacement_round * self.canonical_primary_scene_count)
+            if source_index >= source_count:
+                raise RuntimeError(
+                    f"Canonical {self.current_phase} map pool exhausted: "
+                    f"need index {source_index}, have {source_count} maps")
+        else:
+            source_index = self.current_env_id % source_count
+            if (not self.has_split_map_pools and
+                    self.current_phase == 'val' and source_count > 1):
+                source_index = (source_index + 1) % source_count
         self.current_external_map_index = source_index
-        self.external_map_path = self.external_map_paths[source_index]
+        self.external_map_path = phase_paths[source_index]
         rospy.loginfo(
             "Selected external source map %d/%d for env%06d (%s): %s",
             source_index + 1, source_count, self.current_env_id,
@@ -1992,6 +2199,157 @@ class TerrainDatasetGenerator:
             f"y[{source_min[1]:.3f}, {source_max[1]:.3f}]. "
             "Check external_map_physical_size, or reduce crop_padding/"
             "crop_min_points/crop_min_coverage.")
+
+    def validate_canonical_external_map(self, source_pcd):
+        """Validate an already prepared metric map without augmenting it.
+
+        Canonical maps are immutable base maps: no scale, rotation, random
+        crop, or recentering is allowed here.  Their cell centers must cover
+        the configured target bounds at the configured resolution.
+        """
+        points = np.asarray(source_pcd.points, dtype=np.float64)
+        if len(points) == 0 or not np.isfinite(points).all():
+            raise ValueError("Canonical external map contains invalid points")
+        half_size = self.target_map_size / 2.0
+        tolerance = max(1e-6, self.target_resolution * 0.05)
+        if (np.any(points[:, 0] < -half_size - tolerance) or
+                np.any(points[:, 0] >= half_size + tolerance) or
+                np.any(points[:, 1] < -half_size - tolerance) or
+                np.any(points[:, 1] >= half_size + tolerance)):
+            raise ValueError(
+                "Canonical external map has points outside configured bounds")
+
+        xy_min = points[:, :2].min(axis=0)
+        xy_max = points[:, :2].max(axis=0)
+        expected_min = -half_size + 0.5 * self.target_resolution
+        expected_max = half_size - 0.5 * self.target_resolution
+        coverage_tolerance = self.target_resolution * 0.1
+        if (np.any(xy_min > expected_min + coverage_tolerance) or
+                np.any(xy_max < expected_max - coverage_tolerance)):
+            raise ValueError(
+                "Canonical external map does not cover the expected cell "
+                f"centers [{expected_min:.3f}, {expected_max:.3f}]; got "
+                f"min={xy_min}, max={xy_max}")
+
+        grid_size = int(round(self.target_map_size / self.target_resolution))
+        ix = np.floor(
+            (points[:, 0] + half_size) / self.target_resolution).astype(int)
+        iy = np.floor(
+            (points[:, 1] + half_size) / self.target_resolution).astype(int)
+        inside = ((ix >= 0) & (ix < grid_size) &
+                  (iy >= 0) & (iy < grid_size))
+        occupied = np.unique(iy[inside] * grid_size + ix[inside])
+        coverage = len(occupied) / float(grid_size * grid_size)
+        if coverage < 0.97:
+            raise ValueError(
+                f"Canonical external map coverage {coverage:.3f} < 0.97")
+
+        z_min = float(points[:, 2].min())
+        z_max = float(points[:, 2].max())
+        if z_min < -0.009 or z_max > 5.0:
+            raise ValueError(
+                "Canonical external map violates UnevenMap z contract "
+                f"[-0.01, 5.0]: [{z_min:.3f}, {z_max:.3f}]")
+
+        source_transform = {
+            'raw_bounds': (
+                float(xy_min[0]), float(xy_max[0]),
+                float(xy_min[1]), float(xy_max[1])),
+            'raw_center': (0.0, 0.0),
+            'raw_horizontal_extent': (
+                float(xy_max[0] - xy_min[0]),
+                float(xy_max[1] - xy_min[1])),
+            'meters_per_source_unit': 1.0,
+            'physical_size': self.target_map_size,
+            'scale_z': False,
+            'canonical': True,
+        }
+        crop_info = {
+            'mode': 'canonical',
+            'center_in_source_frame': (0.0, 0.0),
+            'center_in_original_frame': (0.0, 0.0),
+            'center_in_raw_source_frame': (0.0, 0.0),
+            'yaw_deg': 0.0,
+            'yaw_rad': 0.0,
+            'yaw_in_original_frame_deg': 0.0,
+            'fixed_source_yaw_deg': 0.0,
+            'target_map_size': self.target_map_size,
+            'target_resolution': self.target_resolution,
+            'local_bounds': (
+                -half_size, half_size, -half_size, half_size),
+            'padding': 0.0,
+            'points_in_target': int(len(points)),
+            'points_with_padding': int(len(points)),
+            'coarse_coverage': float(coverage),
+            'sampling_attempt': 0,
+            'source_transform': dict(source_transform),
+            'source_bounds': (
+                float(xy_min[0]), float(xy_max[0]),
+                float(xy_min[1]), float(xy_max[1])),
+        }
+        rospy.loginfo(
+            "Accepted canonical external map: points=%d, coverage=%.1f%%, "
+            "z=[%.3f, %.3f]m; augmentation disabled",
+            len(points), coverage * 100.0, z_min, z_max)
+        return source_pcd, source_transform, crop_info
+
+    def load_canonical_grid(self, map_path):
+        sidecar_path = os.path.splitext(map_path)[0] + '.npz'
+        if not os.path.exists(sidecar_path):
+            raise FileNotFoundError(
+                "Canonical map requires an NPZ grid sidecar: " +
+                sidecar_path)
+        sidecar = np.load(sidecar_path)
+        required = {
+            'elevation', 'normal_x', 'normal_y', 'normal_z',
+            'valid_mask', 'resolution', 'size'}
+        missing = sorted(required.difference(sidecar.files))
+        if missing:
+            raise ValueError(
+                "Canonical NPZ is missing fields: " + ', '.join(missing))
+
+        grid_size = int(round(self.target_map_size / self.target_resolution))
+        expected_shape = (grid_size, grid_size)
+        result = {}
+        for field in ('elevation', 'normal_x', 'normal_y', 'normal_z'):
+            value = np.asarray(sidecar[field], dtype=np.float32)
+            if value.shape != expected_shape or not np.isfinite(value).all():
+                raise ValueError(
+                    f"Canonical NPZ field {field} must be finite with "
+                    f"shape {expected_shape}, got {value.shape}")
+            result[field] = value
+        valid_mask = np.asarray(sidecar['valid_mask'], dtype=bool)
+        if valid_mask.shape != expected_shape:
+            raise ValueError(
+                f"Canonical valid_mask has shape {valid_mask.shape}, "
+                f"expected {expected_shape}")
+        if valid_mask.mean() < 0.97:
+            raise ValueError(
+                f"Canonical valid fraction {valid_mask.mean():.3f} < 0.97")
+        if not math.isclose(
+                float(sidecar['resolution']), self.target_resolution,
+                rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError("Canonical NPZ resolution mismatch")
+        if not math.isclose(
+                float(sidecar['size']), self.target_map_size,
+                rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError("Canonical NPZ size mismatch")
+        half_size = 0.5 * self.target_map_size
+        result['valid_mask'] = valid_mask
+        result['bounds'] = (-half_size, half_size, -half_size, half_size)
+        result['resolution'] = self.target_resolution
+        rospy.loginfo(
+            "Loaded canonical grid sidecar %s: shape=%s, valid=%.2f%%",
+            sidecar_path, expected_shape, valid_mask.mean() * 100.0)
+        return result
+
+    @staticmethod
+    def load_canonical_metadata(map_path):
+        metadata_path = os.path.splitext(map_path)[0] + '.json'
+        if not os.path.exists(metadata_path):
+            return None
+        with open(metadata_path, encoding='utf-8') as stream:
+            return json.load(stream)
     
     def generate_new_environment(self):
         """生成新的地形环境"""
@@ -2025,18 +2383,39 @@ class TerrainDatasetGenerator:
             if cache_entry is None:
                 rospy.loginfo("Loading and caching external source map...")
                 source_pcd = self.load_external_map()
-                source_pcd, source_transform = (
-                    self.normalize_external_map_scale(source_pcd))
-                source_pcd = self.prepare_external_map_frame(source_pcd)
-                cache_entry = (source_pcd, source_transform)
+                if self.external_map_is_canonical:
+                    source_pcd, source_transform, canonical_info = (
+                        self.validate_canonical_external_map(source_pcd))
+                    source_metadata = self.load_canonical_metadata(
+                        selected_map_path)
+                    if source_metadata is not None:
+                        canonical_info['mother_map_sample'] = source_metadata
+                    canonical_grid = self.load_canonical_grid(
+                        selected_map_path)
+                    cache_entry = (
+                        source_pcd, source_transform, canonical_info,
+                        canonical_grid)
+                else:
+                    source_pcd, source_transform = (
+                        self.normalize_external_map_scale(source_pcd))
+                    source_pcd = self.prepare_external_map_frame(source_pcd)
+                    cache_entry = (source_pcd, source_transform, None, None)
                 self.cached_external_source_maps[selected_map_path] = cache_entry
             else:
                 rospy.loginfo(
                     "Reusing cached external source map: %s",
                     selected_map_path)
-            source_pcd, self.current_source_transform = cache_entry
-            pcd, grid_input_pcd, self.current_crop_info = (
-                self.sample_rotated_external_crop(source_pcd))
+            (source_pcd, self.current_source_transform, canonical_info,
+             canonical_grid) = cache_entry
+            if self.external_map_is_canonical:
+                pcd = source_pcd
+                grid_input_pcd = source_pcd
+                self.current_crop_info = dict(canonical_info)
+                self.current_canonical_grid = canonical_grid
+            else:
+                self.current_canonical_grid = None
+                pcd, grid_input_pcd, self.current_crop_info = (
+                    self.sample_rotated_external_crop(source_pcd))
 
             # 为外部地图创建基本的terrain_info
             points = np.asarray(pcd.points)
@@ -2065,12 +2444,17 @@ class TerrainDatasetGenerator:
         
         # 转换为栅格地图
         if self.use_external_map:
-            # 点云已经被旋转、裁剪并移到局部坐标系。只对20m目标区域
-            # 栅格化，避免先处理整张大地图再做固定中心裁剪。
-            half_size = self.target_map_size / 2.0
-            map_bounds = (-half_size, half_size, -half_size, half_size)
-            grid_map_data = self.grid_transformer.transform_pointcloud_to_grid(
-                grid_input_pcd, map_bounds)
+            if self.external_map_is_canonical:
+                # The NPZ sidecar is the already audited network/occupancy
+                # grid. Keep the dense PCD exclusively for UnevenMap fitting.
+                grid_map_data = dict(self.current_canonical_grid)
+            else:
+                # 点云已经被旋转、裁剪并移到局部坐标系。只对20m目标区域
+                # 栅格化，避免先处理整张大地图再做固定中心裁剪。
+                half_size = self.target_map_size / 2.0
+                map_bounds = (-half_size, half_size, -half_size, half_size)
+                grid_map_data = self.grid_transformer.transform_pointcloud_to_grid(
+                    grid_input_pcd, map_bounds)
 
             # 不再通过 resize 隐式改变物理分辨率；服务必须直接输出100x100。
             expected_grid_size = int(round(
@@ -2117,6 +2501,16 @@ class TerrainDatasetGenerator:
                 # compute_map_yaw_bins 返回 torch.Tensor，可转换为 numpy
                 yaw_scores = compute_map_yaw_bins(self.current_normal_x, self.current_normal_y, self.current_normal_z, self.current_yaw_bins)
                 yaw_scores = np.array(yaw_scores)
+                valid_mask = np.asarray(
+                    grid_map_data.get(
+                        'valid_mask',
+                        np.ones(self.current_normal_x.shape, dtype=bool)),
+                    dtype=bool)
+                if valid_mask.shape != self.current_normal_x.shape:
+                    raise ValueError(
+                        f"valid_mask shape {valid_mask.shape} does not match "
+                        f"normal grid {self.current_normal_x.shape}")
+                yaw_scores[~valid_mask, :] = 0.0
                 # normalize to (H, W, Y)
                 try:
                     Hn, Wn = self.current_normal_x.shape
@@ -2157,6 +2551,7 @@ class TerrainDatasetGenerator:
                     validation_scores = (
                         validation_scores.detach().cpu().numpy())
                 validation_scores = np.asarray(validation_scores)
+                validation_scores[~valid_mask, :] = 0.0
                 expected_shape = (
                     self.current_normal_x.shape[0],
                     self.current_normal_x.shape[1],
@@ -2269,6 +2664,11 @@ class TerrainDatasetGenerator:
                 'original_map_path': self.external_map_path,
                 'original_map_index': self.current_external_map_index,
                 'crop': dict(self.current_crop_info),
+                'valid_mask': np.asarray(
+                    grid_map_data.get(
+                        'valid_mask',
+                        np.ones(grid_map_tensor.shape[:2], dtype=bool)),
+                    dtype=bool),
                 'target_grid_size': f"{grid_map_tensor.shape[0]}x{grid_map_tensor.shape[1]}"
             }
             rospy.loginfo(
@@ -2335,6 +2735,19 @@ class TerrainDatasetGenerator:
         map_data['planner_map_version'] = self.current_planner_map_version
         map_data['planner_map_request_id'] = self.map_update_request_id
         map_data['planner_point_count'] = int(update_response.point_count)
+        map_application = {
+            'environment_id': self.current_env_id,
+            'phase': self.current_phase,
+            'map_version': self.current_planner_map_version,
+            'map_request_id': self.map_update_request_id,
+            'point_count': int(update_response.point_count),
+            'occupied_se2': int(update_response.occupied_voxel_count),
+            'occupied_xy': int(update_response.occupied_xy_count),
+            'source_yaw_bins': int(update_response.source_yaw_bins),
+            'internal_yaw_bins': int(update_response.internal_yaw_bins),
+        }
+        self.map_application_records.append(map_application)
+        self.write_experiment_manifest()
         rospy.loginfo(
             "Planner atomically applied %s: version=%d, points=%d, "
             "occupied_se2=%d, occupied_xy=%d, yaw=%d->%d",
@@ -2843,6 +3256,18 @@ class TerrainDatasetGenerator:
         self.active_planning_attempt_id = None
         self.waiting_for_result = False
 
+    def finish_attempt_record(self, outcome, **details):
+        if self.active_attempt_record is None:
+            return
+        self.active_attempt_record.update(
+            outcome=outcome,
+            finished_utc=datetime.datetime.now(
+                datetime.timezone.utc).isoformat(),
+            **self._json_safe(details))
+        self.attempt_records.append(self.active_attempt_record)
+        self.active_attempt_record = None
+        self.write_experiment_manifest()
+
     def schedule_next_path(self, delay=None, reason=""):
         """保证任意时刻最多只有一个待执行的路径生成定时器。"""
         if delay is None:
@@ -2888,6 +3313,63 @@ class TerrainDatasetGenerator:
         if limit <= 0 or self.path_retry_count < limit:
             return False
 
+        if self.external_map_is_canonical:
+            self.retry_statistics['canonical_map_rejected'] += 1
+            phase_paths = (self.train_external_map_paths
+                           if self.current_phase == 'train'
+                           else self.val_external_map_paths)
+            replacement_key = (self.current_phase, self.current_env_id)
+            next_round = self.canonical_replacement_round.get(
+                replacement_key, 0) + 1
+            local_environment = (
+                self.current_env_id - self.canonical_pool_start_env_id)
+            next_index = (
+                local_environment
+                + next_round * self.canonical_primary_scene_count)
+            rejection = {
+                'environment_id': self.current_env_id,
+                'phase': self.current_phase,
+                'path_id': self.current_path_id,
+                'failed_attempts': self.path_retry_count,
+                'rejected_map': self.external_map_path,
+                'replacement_index': next_index,
+                'replacement_available': next_index < len(phase_paths),
+                'recorded_utc': datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(),
+            }
+            self.canonical_map_rejections.append(rejection)
+            if next_index < len(phase_paths):
+                self.retry_statistics['canonical_map_replaced'] += 1
+                self.canonical_replacement_round[replacement_key] = next_round
+                rospy.logwarn(
+                    "Canonical map rejected after path_%d failed %d "
+                    "consecutive attempts in env%06d (%s); replacing %s "
+                    "with pool index %d",
+                    self.current_path_id, self.path_retry_count,
+                    self.current_env_id, self.current_phase,
+                    self.external_map_path, next_index)
+                self.finish_active_planning_attempt()
+                self.cancel_timer('next_path_timer')
+                self.write_experiment_manifest()
+                rospy.Timer(
+                    rospy.Duration(self.publish_delay),
+                    self.regenerate_current_environment, oneshot=True)
+                return True
+
+            rospy.logfatal(
+                "Canonical map rejected after path_%d failed %d "
+                "consecutive attempts in env%06d (%s); replacement pool "
+                "exhausted. Retry statistics: %s",
+                self.current_path_id, self.path_retry_count,
+                self.current_env_id, self.current_phase,
+                self.retry_statistics)
+            self.finish_active_planning_attempt()
+            self.experiment_status = 'map_rejected'
+            self.write_experiment_manifest()
+            self.cancel_timer('next_path_timer')
+            rospy.signal_shutdown("canonical map failed planner acceptance")
+            return True
+
         self.retry_statistics['environment_regenerated'] += 1
         rospy.logwarn(
             "Path_%d failed %d consecutive attempts; regenerating "
@@ -2919,6 +3401,7 @@ class TerrainDatasetGenerator:
         else:
             self.retry_statistics['planning_failed'] += 1
             self.path_retry_count += 1
+            self.finish_attempt_record('planning_failed')
             rospy.logwarn(
                 "Planning failed for path_%d (retry %d); sampling a new "
                 "prevalidated pose pair",
@@ -2972,6 +3455,7 @@ class TerrainDatasetGenerator:
             rospy.logwarn(f"Invalid or empty trajectory for path_{self.current_path_id}, retrying...")
             self.retry_statistics['empty_trajectory'] += 1
             self.path_retry_count += 1
+            self.finish_attempt_record('empty_trajectory')
             self.finish_active_planning_attempt()
             if self.regenerate_if_retry_limit_reached():
                 return
@@ -3028,6 +3512,9 @@ class TerrainDatasetGenerator:
                 rospy.loginfo(
                     "Continuous stability minimum margin: %.4fm",
                     validation['minimum_margin'])
+                if self.active_attempt_record is not None:
+                    self.active_attempt_record['minimum_stability_margin_m'] = (
+                        float(validation['minimum_margin']))
                     
         # 输出验证结果统计
         if not invalid_found:
@@ -3040,6 +3527,9 @@ class TerrainDatasetGenerator:
         if invalid_found:
             self.retry_statistics['trajectory_unstable'] += 1
             self.path_retry_count += 1
+            self.finish_attempt_record(
+                'trajectory_unstable', unstable_points=unstable_count,
+                trajectory_points=total_points)
             rospy.logwarn(
                 "Trajectory for path_%d is unstable (retry %d); keeping "
                 "strict validation and sampling another pair",
@@ -3578,6 +4068,9 @@ class TerrainDatasetGenerator:
         path_file = os.path.join(env_dir, f"path_{self.current_path_id}.p")
         with open(path_file, 'wb') as f:
             pickle.dump(path_data, f)
+        self.finish_attempt_record(
+            'saved', path_file=os.path.abspath(path_file),
+            trajectory_points=len(trajectory_path))
         
         rospy.loginfo(f"Saved {path_file} with {len(trajectory_path)} original trajectory points")
         
@@ -3593,6 +4086,16 @@ class TerrainDatasetGenerator:
             rospy.loginfo(f"Completed {self.current_phase} phase for environment {self.current_env_id}")
             
             if self.current_phase == 'train':
+                if self.stop_after_train:
+                    self.finish_active_planning_attempt()
+                    self.current_trajectory = None
+                    self.experiment_status = 'completed'
+                    self.write_experiment_manifest()
+                    rospy.loginfo(
+                        "Train-only generation completed! Retry statistics: %s",
+                        self.retry_statistics)
+                    rospy.signal_shutdown("train-only generation completed")
+                    return
                 # val拥有独立地图；多源地图时还会避开同index train所用源。
                 self.finish_active_planning_attempt()
                 self.current_trajectory = None
@@ -3618,6 +4121,8 @@ class TerrainDatasetGenerator:
                 
                 # 检查是否所有环境都已完成
                 if self.current_env_id >= self.start_env_id + self.num_environments:
+                    self.experiment_status = 'completed'
+                    self.write_experiment_manifest()
                     rospy.loginfo(
                         "Dataset generation completed! Retry statistics: %s",
                         self.retry_statistics)
@@ -3702,6 +4207,23 @@ class TerrainDatasetGenerator:
         self.planning_attempt_id += 1
         attempt_id = self.planning_attempt_id
         self.active_planning_attempt_id = attempt_id
+        self.active_attempt_record = {
+            'attempt_id': attempt_id,
+            'started_utc': datetime.datetime.now(
+                datetime.timezone.utc).isoformat(),
+            'environment_id': self.current_env_id,
+            'phase': self.current_phase,
+            'path_id': self.current_path_id,
+            'retry_index': self.path_retry_count,
+            'start_pose': [start_x, start_y, start_yaw],
+            'target_pose': [target_x, target_y, target_yaw],
+            'sampling_profile': self._json_safe(
+                self.current_pose_sampling_profile),
+            'planner_map_version': self.current_planner_map_version,
+            'planner_map_request_id': self.map_update_request_id,
+        }
+        self.experiment_status = 'running'
+        self.write_experiment_manifest()
         
         # 更新期望的路径ID
         self.expected_path_id = self.current_path_id
@@ -3934,6 +4456,14 @@ class TerrainDatasetGenerator:
                         f"{stability_map.shape} != {expected_shape}")
                 stability_map = np.asarray(
                     stability_map, dtype=np.float32)
+                valid_mask = np.asarray(
+                    grid_map_data.get(
+                        'valid_mask', np.ones((H, W), dtype=bool)),
+                    dtype=bool)
+                if valid_mask.shape != (H, W):
+                    raise ValueError(
+                        f"valid_mask shape {valid_mask.shape} != {(H, W)}")
+                stability_map[~valid_mask, :] = 0.0
                 
                 # 将x和y进行互换
                 # stability_map = np.transpose(stability_map, (1, 0, 2))
@@ -4067,8 +4597,10 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"Actual grid shape: {actual_shape}")
         rospy.loginfo(f"Bounds: {grid_map_data.get('bounds', 'Unknown')}")
         rospy.loginfo(f"Resolution: {grid_map_data.get('resolution', 'Unknown')}")
-        rospy.loginfo(
-            "Processing method: Random translated/rotated point-cloud crop")
+        processing_method = (
+            "Audited canonical fitted surface" if self.external_map_is_canonical
+            else "Random translated/rotated point-cloud crop")
+        rospy.loginfo("Processing method: %s", processing_method)
         
         # 验证栅格尺寸
         if actual_shape == (expected_grid_size, expected_grid_size):
