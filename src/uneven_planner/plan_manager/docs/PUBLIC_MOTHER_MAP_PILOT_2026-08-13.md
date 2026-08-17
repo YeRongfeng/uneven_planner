@@ -1,19 +1,24 @@
-# Public Mother-Map Pilot — 2026-08-13
+# Public Mother-Map Pilot — 2026-08-13 (historical)
+
+The class-2 surface contract described by the original pilot is superseded by
+the raw-point-cloud obstacle contract in
+`RAW_POINT_CLOUD_OBSTACLE_CONTRACT.md`. The numerical results below are kept as
+historical evidence only; they are not the current release specification.
 
 ## Decision
 
 `desert`, `forest`, `hill`, `snow`, and `volcano` are retained as source-domain
-metadata, not model targets. The generated `map.p` contains elevation and
-surface normals only. Dataset balancing therefore uses source site,
+metadata, not model targets. The generated `map.p` carries elevation, surface
+normals, and the physical-obstacle layer. Dataset balancing therefore uses source site,
 acquisition profile, and measured easy/medium/hard geometry. Train and
 validation must use different survey sites.
 
 ## Reconstruction profiles and fixed parameters
 
 - Output: 20 m x 20 m, 0.2 m grid, 0.05 m planner surface.
-- ALS profile: class-2 source surface, 0.9 m fit radius, at least 5 neighbours,
+- ALS profile: all finite XYZ returns with geometry-only ground extraction, 0.9 m fit radius, at least 5 neighbours,
   at least 4 source points/m2, and at least 97% occupied 1 m support cells.
-- ULS profile: class-2 source surface, 0.35 m fit radius, at least 8 neighbours,
+- ULS profile: all finite XYZ returns with geometry-only ground extraction, 0.35 m fit radius, at least 8 neighbours,
   at least 40 source points/m2, and at least 97% occupied 0.2 m support cells.
 - Common fit RMSE ceiling: 0.12 m per local fit and 0.08 m at P95.
 - Sampling seeds: desert 20260813, forest 20260821, hill 20260822, volcano

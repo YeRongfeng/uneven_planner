@@ -5,6 +5,8 @@
     <arg name="train_paths_per_env" default="200" doc="每个环境的训练路径数量"/>
     <arg name="val_paths_per_env" default="20" doc="每个环境的验证路径数量"/>
     <arg name="stop_after_train" default="false" doc="train完成后结束；用于逐地图Stage-C校准"/>
+    <arg name="start_phase" default="train" doc="从train或val阶段开始；单环境替换时使用val"/>
+    <arg name="terminate_after_generator" default="false" doc="生成器退出后关闭本次launch；用于单环境替换"/>
     <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset20" doc="数据集输出目录"/>
     <arg name="start_env_id" default="50" doc="起始环境ID"/>
     <arg name="experiment_manifest_name" default="experiment_manifest.json" doc="本生成进程的实验记录文件名；并行worker必须各自独立"/>
@@ -21,7 +23,35 @@
     <arg name="external_map_paths" default="" doc="逗号分隔的外部地图列表；为空时兼容使用external_map_path"/>
     <arg name="train_external_map_paths" default="" doc="train专用canonical地图列表；与val列表同时使用"/>
     <arg name="val_external_map_paths" default="" doc="val专用canonical地图列表；与train列表同时使用"/>
-    <arg name="external_map_format" default="pcd" doc="外部地图格式：pcd、ply、txt、heightmap"/>
+    <arg name="external_map_format" default="pcd" doc="外部地图格式：pcd、ply、txt、heightmap、las、laz"/>
+    <arg name="train_external_source_profile" default="als" doc="train母图质量剖面：als或uls"/>
+    <arg name="val_external_source_profile" default="als" doc="val母图质量剖面：als或uls"/>
+    <arg name="external_domain" default="" doc="源地形域标签"/>
+    <arg name="train_external_source_url" default=""/>
+    <arg name="val_external_source_url" default=""/>
+    <arg name="train_external_license" default=""/>
+    <arg name="val_external_license" default=""/>
+    <arg name="train_external_crs" default=""/>
+    <arg name="val_external_crs" default=""/>
+    <arg name="train_external_site_id" default=""/>
+    <arg name="val_external_site_id" default=""/>
+    <arg name="external_accepted_grades" default="easy,medium,hard" doc="在线裁剪允许保存的难度等级"/>
+    <arg name="external_fit_radius" default="-1.0" doc="在线表面拟合半径；负数使用源剖面默认值"/>
+    <arg name="external_surface_cell_size" default="-1.0" doc="在线地面候选单元尺寸；负数使用源剖面默认值"/>
+    <arg name="external_direct_fit_min_points" default="-1" doc="局部平面拟合最少点数；负数使用源剖面默认值"/>
+    <arg name="external_ground_band_below" default="0.25"/>
+    <arg name="external_ground_band_above" default="0.35"/>
+    <arg name="external_envelope_outlier" default="0.75"/>
+    <arg name="external_planner_surface_resolution" default="0.05"/>
+    <arg name="external_raw_below_surface_tolerance" default="1.0"/>
+    <arg name="external_raw_above_surface_tolerance" default="50.0"/>
+    <arg name="external_above_surface_height" default="2.0"/>
+    <arg name="external_above_surface_cell_size" default="1.0"/>
+    <arg name="external_max_above_surface_coverage" default="1.0"/>
+    <arg name="external_min_above_surface_component_cells" default="0"/>
+    <arg name="external_tree_class_values" default="1"/>
+    <arg name="external_ground_class_values" default="2"/>
+    <arg name="external_min_tree_component_cells" default="0"/>
     <arg name="external_map_is_canonical" default="false" doc="地图已严格满足目标米制栅格契约；跳过缩放、旋转和随机裁剪"/>
     <arg name="canonical_maps_per_environment" default="1" doc="每个split为每个环境准备的canonical候选数，含首选地图"/>
     <arg name="canonical_primary_scene_count" default="-1" doc="canonical池每轮跨度；负数使用本进程环境数"/>
@@ -36,7 +66,7 @@
     <arg name="crop_rotation_max_deg" default="180.0" doc="随机裁剪旋转角上限（度）"/>
     <arg name="crop_padding" default="1.0" doc="裁剪边缘额外保留范围（米），用于法向量估计"/>
     <arg name="crop_min_points" default="50" doc="20m目标区域内允许的最少点数"/>
-    <arg name="crop_min_coverage" default="0.85" doc="目标区域粗栅格的最低点云覆盖率"/>
+    <arg name="crop_min_coverage" default="0.97" doc="目标区域粗栅格的最低点云覆盖率"/>
     <arg name="crop_max_attempts" default="50" doc="寻找有效随机裁剪区域的最大次数"/>
     <arg name="crop_random_seed" default="-1" doc="随机裁剪种子；-1表示每次随机"/>
     
@@ -120,12 +150,13 @@
     </node>
     
     <!-- 启动地形数据集生成器 -->
-    <node name="terrain_dataset_generator" pkg="plan_manager" type="terrain_dataset_generator.py" output="screen" required="false" launch-prefix="python3.8">
+    <node name="terrain_dataset_generator" pkg="plan_manager" type="terrain_dataset_generator.py" output="screen" required="$(arg terminate_after_generator)" launch-prefix="python3">
         <!-- 数据集参数 -->
         <param name="num_environments" value="$(arg num_environments)"/>
         <param name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
         <param name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
         <param name="stop_after_train" value="$(arg stop_after_train)"/>
+        <param name="start_phase" value="$(arg start_phase)"/>
         <param name="dataset_dir" value="$(arg dataset_dir)"/>
         <param name="start_env_id" value="$(arg start_env_id)"/>
         <param name="experiment_manifest_name" value="$(arg experiment_manifest_name)"/>
@@ -143,6 +174,34 @@
         <param name="train_external_map_paths" value="$(arg train_external_map_paths)"/>
         <param name="val_external_map_paths" value="$(arg val_external_map_paths)"/>
         <param name="external_map_format" value="$(arg external_map_format)"/>
+        <param name="train_external_source_profile" value="$(arg train_external_source_profile)"/>
+        <param name="val_external_source_profile" value="$(arg val_external_source_profile)"/>
+        <param name="external_domain" value="$(arg external_domain)"/>
+        <param name="train_external_source_url" value="$(arg train_external_source_url)"/>
+        <param name="val_external_source_url" value="$(arg val_external_source_url)"/>
+        <param name="train_external_license" value="$(arg train_external_license)"/>
+        <param name="val_external_license" value="$(arg val_external_license)"/>
+        <param name="train_external_crs" value="$(arg train_external_crs)"/>
+        <param name="val_external_crs" value="$(arg val_external_crs)"/>
+        <param name="train_external_site_id" value="$(arg train_external_site_id)"/>
+        <param name="val_external_site_id" value="$(arg val_external_site_id)"/>
+        <param name="external_accepted_grades" value="$(arg external_accepted_grades)"/>
+        <param name="external_fit_radius" value="$(arg external_fit_radius)"/>
+        <param name="external_surface_cell_size" value="$(arg external_surface_cell_size)"/>
+        <param name="external_direct_fit_min_points" value="$(arg external_direct_fit_min_points)"/>
+        <param name="external_ground_band_below" value="$(arg external_ground_band_below)"/>
+        <param name="external_ground_band_above" value="$(arg external_ground_band_above)"/>
+        <param name="external_envelope_outlier" value="$(arg external_envelope_outlier)"/>
+        <param name="external_planner_surface_resolution" value="$(arg external_planner_surface_resolution)"/>
+        <param name="external_raw_below_surface_tolerance" value="$(arg external_raw_below_surface_tolerance)"/>
+        <param name="external_raw_above_surface_tolerance" value="$(arg external_raw_above_surface_tolerance)"/>
+        <param name="external_above_surface_height" value="$(arg external_above_surface_height)"/>
+        <param name="external_above_surface_cell_size" value="$(arg external_above_surface_cell_size)"/>
+        <param name="external_max_above_surface_coverage" value="$(arg external_max_above_surface_coverage)"/>
+        <param name="external_min_above_surface_component_cells" value="$(arg external_min_above_surface_component_cells)"/>
+        <param name="external_tree_class_values" value="$(arg external_tree_class_values)"/>
+        <param name="external_ground_class_values" value="$(arg external_ground_class_values)"/>
+        <param name="external_min_tree_component_cells" value="$(arg external_min_tree_component_cells)"/>
         <param name="external_map_is_canonical" value="$(arg external_map_is_canonical)"/>
         <param name="canonical_maps_per_environment" value="$(arg canonical_maps_per_environment)"/>
         <param name="canonical_primary_scene_count" value="$(eval int(arg('num_environments')) if int(arg('canonical_primary_scene_count')) &lt;= 0 else int(arg('canonical_primary_scene_count')))"/>

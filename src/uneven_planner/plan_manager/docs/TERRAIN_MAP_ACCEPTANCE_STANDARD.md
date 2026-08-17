@@ -1,4 +1,4 @@
-# 20 m Terrain Map Acceptance Standard (v2)
+# 20 m Terrain Map Acceptance Standard (v3-continuous)
 
 This standard separates map validity, geometric difficulty, and planner
 difficulty. A map must pass all three stages before entering a released
@@ -10,22 +10,36 @@ criterion.
 - Metric 20 m x 20 m terrain, sampled on a 100 x 100 grid at 0.2 m.
 - Source coordinates may be translated and source elevation may be offset.
   The x, y, or z axes must never be scaled to satisfy the map size.
-- Terrain height and normals come from classified ground returns or an
-  explicitly documented ground-surface reconstruction.
+- Terrain height and normals come from an explicitly documented
+  geometry-only reconstruction over raw finite XYZ returns. LAS classification
+  is provenance only and is not available in the deployed ROS point cloud.
 - Surface reconstruction has two explicit acquisition profiles. ULS uses a
-  0.35 m local-plane radius, at least 8 neighbours, and at least 40 source
-  points/m2. ALS uses a 0.9 m radius, at least 5 neighbours, at least 4 source
+  0.35 m local-plane radius, at least 8 points for a direct fit, and at least 40 source
+  points/m2. ALS uses a 0.9 m radius, at least 5 points for a direct fit, at least 4 source
   points/m2, and at least 97% occupied 1 m support cells. ALS preserves
   metre-scale landform but cannot be treated as evidence of 0.4 m microterrain.
   The profile and parameters are recorded for every map. Released splits must
   be balanced by profile; they must not silently mix reconstruction scales.
 - Keep two representations: a 100 x 100 grid for network input and a dense
-  resampling of the same robust fitted surface for UnevenMap's local ellipsoid
-  fit. The current planner-cloud reference spacing is 0.05 m. Raw classified
-  returns provide density and fit evidence but are not passed directly to
-  UnevenMap. A one-point-per-cell grid is also too sparse for planner fitting.
-- Upward normals must be unit length. The source, licence, CRS, crop center,
-  processing parameters, and valid mask must be retained.
+  resampling of the same completed fitted surface for UnevenMap's local ellipsoid
+  fit. The current planner-cloud reference spacing is 0.05 m. Raw returns
+  provide density and fit evidence but are not passed directly to UnevenMap. A
+  one-point-per-cell grid is also too sparse for planner fitting.
+- Above-ground returns are retained separately as `obstacle_mask` and
+  `obstacle_height` on the same grid. The dense ground PCD must contain no
+  tree/canopy returns. Physical obstacle cells are inflated by the configured
+  robot footprint before trajectory acceptance; they are not folded into the
+  ground elevation surface.
+- Local-plane RMSE and MAD residuals do not determine validity: non-planarity
+  is terrain, not missing data. MAD may refine an estimate but must not reject a
+  cell. Cells without enough direct points are harmonically completed from the
+  neighbouring elevation surface, then normals are recomputed from that
+  completed surface.
+- Upward normals must be unit length. The network and planner surfaces must be
+  finite over the complete crop. Retain `observed_mask` separately to record
+  which cells had a direct source-cloud fit; it is diagnostic provenance, not
+  a training-validity mask.
+- The source, licence, CRS, crop center, and processing parameters must be retained.
 - The current `UnevenMap` loader hard-clips PCD input to z in [-0.01, 5.0] m.
   Output z is therefore translated by the patch minimum. Maps with more than
   5 m true vertical span require a loader-contract change; they must not be
@@ -40,15 +54,14 @@ A map is rejected if any condition below is met:
 
 | Metric | Rejection threshold | Purpose |
 |---|---:|---|
-| Valid grid fraction | < 0.97 | Prevent large filled or unknown regions |
+| Finite completed grid fraction | < 1.00 | Do not deliver holes or NaNs to the network/planner |
 | Runtime z range | outside [-0.01, 5.0] m | Prevent silent clipping by UnevenMap |
 | ULS source-surface density | < 40 points/m2 | Support 0.35 m local fitting |
 | ALS source-surface density | < 4 points/m2 | Support 0.9 m local fitting |
 | ALS source support at 1 m | < 0.97 | Reject holes despite adequate mean density |
 | Planner-surface density | < 40 points/m2 | Support UnevenMap fitting |
-| Local-plane RMSE P95 | > 0.08 m | Reject poor fits and mixed surfaces |
 | Normal length error P99 | > 0.01 | Enforce the map representation contract |
-| Adjacent-cell height jump | > 0.50 m | Detect isolated classification spikes |
+| Adjacent-cell height jump | > 0.50 m | Detect isolated reconstruction spikes |
 | Largest connected slope-valid area | < 0.70 | Preserve a meaningful planning region |
 | Area steeper than 36.87 degrees | > 0.25 | Reject overwhelmingly non-traversable maps |
 
@@ -58,8 +71,8 @@ quarantined rather than accepted by visual preference.
 
 ## 3. Stage B: geometric difficulty
 
-Difficulty is measured at three scales after nearest-filling only for metric
-calculation. The valid mask itself is never discarded.
+Difficulty is measured at three scales on the completed finite surface.
+`observed_mask` remains available to audit where completion was used.
 
 - Micro scale (0.4 m): vibration-sized roughness near the vehicle wheelbase.
 - Local scale (1.2 m): mounds, ruts, ridge transitions, and local curvature.
@@ -98,7 +111,7 @@ separate acceptance label. The score profile is written to every result.
 For each quality-passing base map, use a deterministic benchmark set before
 dataset generation:
 
-- Sample start/goal pairs from valid connected terrain, at least 8 m apart.
+- Sample start/goal pairs from slope-valid connected terrain, at least 8 m apart.
 - Use the same fixed pair list and yaw protocol for every candidate map.
 - Record planning success, stable-trajectory success, normalized path length,
   maximum/mean slope along the path, planning time, and failure reason.

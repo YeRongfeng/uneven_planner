@@ -49,10 +49,8 @@ for index in "${!maps[@]}"; do
         echo "Refusing to overwrite calibration output: ${scene_output}" >&2
         exit 1
     fi
-    mkdir -p "${scene_output}/ros_logs" "${scene_output}/matplotlib" \
-        "${scene_output}/dataset"
+    mkdir -p "${scene_output}/ros_logs" "${scene_output}/dataset"
     export ROS_LOG_DIR="${scene_output}/ros_logs"
-    export MPLCONFIGDIR="${scene_output}/matplotlib"
 
     echo "[${grade} ${index}/${#maps[@]}] ${map_path}"
     setsid roslaunch plan_manager terrain_dataset_generation_parallel.launch \

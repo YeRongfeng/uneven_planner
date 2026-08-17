@@ -1,4 +1,9 @@
-# Mother-map online sampling smoke test (2026-08-13)
+# Mother-map online sampling smoke test (2026-08-13, historical)
+
+This smoke test predates the raw-point-cloud obstacle contract and used the
+class-2 surface path. Its results remain useful for the old pipeline only; new
+generation must use geometry-only ground extraction and retain physical
+obstacles.
 
 ## Scope
 
@@ -16,7 +21,7 @@ The deterministic source was
 
 ## Sampling result
 
-- Mother map class-2 returns loaded: 12,921,405.
+- Mother map class-2 returns loaded: 12,921,405 (historical pipeline only).
 - Accepted patches: 5 in 14 attempts (35.7%).
 - Accepted geometry: 2 easy and 3 medium patches.
 - Every accepted network map is 20 m x 20 m at 0.2 m resolution

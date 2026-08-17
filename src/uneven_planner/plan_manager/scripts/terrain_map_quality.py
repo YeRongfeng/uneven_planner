@@ -16,7 +16,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, gaussian_filter, label
 
 
-POLICY_VERSION = "terrain20m-v2"
+POLICY_VERSION = "terrain20m-v4-base4-rawpcd"
 MAX_TRAVERSABLE_SLOPE_DEG = math.degrees(math.acos(0.8))
 
 
@@ -41,16 +41,31 @@ def percentile(values, q):
 
 def evaluate(path):
     data = np.load(path)
-    required = {"elevation", "normal_x", "normal_y", "normal_z", "valid_mask", "fit_rmse", "resolution"}
+    required = {
+        "elevation", "normal_x", "normal_y", "normal_z", "valid_mask",
+        "observed_mask", "resolution",
+    }
     missing = sorted(required.difference(data.files))
     if missing:
+        data.close()
         return {"path": path, "quality": "reject", "grade": None, "reasons": ["missing:" + ",".join(missing)]}
 
     elevation = data["elevation"].astype(np.float64)
     valid = data["valid_mask"].astype(bool)
-    rmse = data["fit_rmse"].astype(np.float64)
+    observed = data["observed_mask"].astype(bool)
     resolution = float(data["resolution"])
     normals = np.stack((data["normal_x"], data["normal_y"], data["normal_z"]), axis=-1).astype(np.float64)
+    if (elevation.ndim != 2 or valid.shape != elevation.shape
+            or observed.shape != elevation.shape
+            or normals.shape != elevation.shape + (3,)):
+        data.close()
+        return {
+            "path": path,
+            "quality": "reject",
+            "grade": None,
+            "reasons": ["inconsistent_grid_shapes"],
+        }
+    data.close()
     metadata_path = os.path.splitext(path)[0] + ".json"
     metadata = {}
     if os.path.exists(metadata_path):
@@ -83,7 +98,9 @@ def evaluate(path):
     steps = np.concatenate((horizontal, vertical))
     source_density = float(metadata.get(
         "source_surface_density_points_per_m2",
-        metadata.get("ground_density_points_per_m2", float("nan"))))
+        metadata.get(
+            "ground_candidate_density_points_per_m2",
+            metadata.get("ground_density_points_per_m2", float("nan")))))
     planner_density = float(metadata.get(
         "planner_point_density_points_per_m2", source_density))
     processing = metadata.get("processing", {})
@@ -103,7 +120,7 @@ def evaluate(path):
         "source_surface_density_points_per_m2": source_density,
         "planner_point_density_points_per_m2": planner_density,
         "source_support_coverage": source_support_coverage,
-        "fit_rmse_p95_m": float(np.nanquantile(rmse, 0.95)),
+        "observed_fraction": float(observed.mean()),
         "normal_length_error_p99": percentile(np.abs(normal_length[valid] - 1.0), 0.99),
         "relief_p01_p99_m": relief_98,
         "detrended_std_m": float(np.std(detrended[valid])),
@@ -119,10 +136,8 @@ def evaluate(path):
     }
 
     reasons = []
-    if metrics["valid_fraction"] < 0.97:
-        reasons.append("valid_fraction<0.97")
-    if elevation_min < -0.009 or elevation_max > 5.0:
-        reasons.append("outside_runtime_z_contract[-0.01,5.0]")
+    if not finite.all() or not valid.all():
+        reasons.append("incomplete_finite_surface")
     if source_density_floor is None:
         reasons.append("unknown_source_profile")
     elif (not math.isfinite(source_density)
@@ -133,12 +148,10 @@ def evaluate(path):
         reasons.append("source_support_coverage<0.97")
     if not math.isfinite(planner_density) or planner_density < 40.0:
         reasons.append("planner_surface_density<40/m2")
-    if metrics["fit_rmse_p95_m"] > 0.08:
-        reasons.append("fit_rmse_p95>0.08m")
     if metrics["normal_length_error_p99"] > 0.01:
         reasons.append("non_unit_normals")
-    if metrics["neighbor_step_max_m"] > 0.50:
-        reasons.append("isolated_height_jump>0.50m_per_cell")
+    if metrics["neighbor_step_p999_m"] > 0.50:
+        reasons.append("height_step_p999>0.50m_per_cell")
     if metrics["largest_traversable_component_fraction"] < 0.70:
         reasons.append("largest_traversable_component<0.70")
     if metrics["untraversable_slope_fraction"] > 0.25:

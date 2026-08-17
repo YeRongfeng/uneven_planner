@@ -7,6 +7,8 @@
     <arg name="train_paths_per_env"/>
     <arg name="val_paths_per_env"/>
     <arg name="stop_after_train"/>
+    <arg name="start_phase"/>
+    <arg name="terminate_after_generator"/>
     <arg name="dataset_dir"/>
     <arg name="start_env_id"/>
 
@@ -20,6 +22,34 @@
     <arg name="train_external_map_paths"/>
     <arg name="val_external_map_paths"/>
     <arg name="external_map_format"/>
+    <arg name="train_external_source_profile"/>
+    <arg name="val_external_source_profile"/>
+    <arg name="external_domain"/>
+    <arg name="train_external_source_url"/>
+    <arg name="val_external_source_url"/>
+    <arg name="train_external_license"/>
+    <arg name="val_external_license"/>
+    <arg name="train_external_crs"/>
+    <arg name="val_external_crs"/>
+    <arg name="train_external_site_id"/>
+    <arg name="val_external_site_id"/>
+    <arg name="external_accepted_grades"/>
+    <arg name="external_fit_radius"/>
+    <arg name="external_surface_cell_size"/>
+    <arg name="external_direct_fit_min_points"/>
+    <arg name="external_ground_band_below"/>
+    <arg name="external_ground_band_above"/>
+    <arg name="external_envelope_outlier"/>
+    <arg name="external_planner_surface_resolution"/>
+    <arg name="external_raw_below_surface_tolerance"/>
+    <arg name="external_raw_above_surface_tolerance"/>
+    <arg name="external_above_surface_height"/>
+    <arg name="external_above_surface_cell_size"/>
+    <arg name="external_max_above_surface_coverage"/>
+    <arg name="external_min_above_surface_component_cells"/>
+    <arg name="external_tree_class_values"/>
+    <arg name="external_ground_class_values"/>
+    <arg name="external_min_tree_component_cells"/>
     <arg name="external_map_is_canonical"/>
     <arg name="canonical_maps_per_environment"/>
     <arg name="canonical_primary_scene_count"/>
@@ -67,6 +97,8 @@
             <arg name="train_paths_per_env" value="$(arg train_paths_per_env)"/>
             <arg name="val_paths_per_env" value="$(arg val_paths_per_env)"/>
             <arg name="stop_after_train" value="$(arg stop_after_train)"/>
+            <arg name="start_phase" value="$(arg start_phase)"/>
+            <arg name="terminate_after_generator" value="$(arg terminate_after_generator)"/>
             <arg name="dataset_dir" value="$(arg dataset_dir)"/>
             <arg name="experiment_manifest_name"
                  value="$(eval 'experiment_manifest_worker_' + str(arg('worker_index')) + '.json')"/>
@@ -80,6 +112,34 @@
             <arg name="train_external_map_paths" value="$(arg train_external_map_paths)"/>
             <arg name="val_external_map_paths" value="$(arg val_external_map_paths)"/>
             <arg name="external_map_format" value="$(arg external_map_format)"/>
+            <arg name="train_external_source_profile" value="$(arg train_external_source_profile)"/>
+            <arg name="val_external_source_profile" value="$(arg val_external_source_profile)"/>
+            <arg name="external_domain" value="$(arg external_domain)"/>
+            <arg name="train_external_source_url" value="$(arg train_external_source_url)"/>
+            <arg name="val_external_source_url" value="$(arg val_external_source_url)"/>
+            <arg name="train_external_license" value="$(arg train_external_license)"/>
+            <arg name="val_external_license" value="$(arg val_external_license)"/>
+            <arg name="train_external_crs" value="$(arg train_external_crs)"/>
+            <arg name="val_external_crs" value="$(arg val_external_crs)"/>
+            <arg name="train_external_site_id" value="$(arg train_external_site_id)"/>
+            <arg name="val_external_site_id" value="$(arg val_external_site_id)"/>
+            <arg name="external_accepted_grades" value="$(arg external_accepted_grades)"/>
+            <arg name="external_fit_radius" value="$(arg external_fit_radius)"/>
+            <arg name="external_surface_cell_size" value="$(arg external_surface_cell_size)"/>
+            <arg name="external_direct_fit_min_points" value="$(arg external_direct_fit_min_points)"/>
+            <arg name="external_ground_band_below" value="$(arg external_ground_band_below)"/>
+            <arg name="external_ground_band_above" value="$(arg external_ground_band_above)"/>
+            <arg name="external_envelope_outlier" value="$(arg external_envelope_outlier)"/>
+            <arg name="external_planner_surface_resolution" value="$(arg external_planner_surface_resolution)"/>
+            <arg name="external_raw_below_surface_tolerance" value="$(arg external_raw_below_surface_tolerance)"/>
+            <arg name="external_raw_above_surface_tolerance" value="$(arg external_raw_above_surface_tolerance)"/>
+            <arg name="external_above_surface_height" value="$(arg external_above_surface_height)"/>
+            <arg name="external_above_surface_cell_size" value="$(arg external_above_surface_cell_size)"/>
+            <arg name="external_max_above_surface_coverage" value="$(arg external_max_above_surface_coverage)"/>
+            <arg name="external_min_above_surface_component_cells" value="$(arg external_min_above_surface_component_cells)"/>
+            <arg name="external_tree_class_values" value="$(arg external_tree_class_values)"/>
+            <arg name="external_ground_class_values" value="$(arg external_ground_class_values)"/>
+            <arg name="external_min_tree_component_cells" value="$(arg external_min_tree_component_cells)"/>
             <arg name="external_map_is_canonical" value="$(arg external_map_is_canonical)"/>
             <arg name="canonical_maps_per_environment" value="$(arg canonical_maps_per_environment)"/>
             <arg name="canonical_primary_scene_count"

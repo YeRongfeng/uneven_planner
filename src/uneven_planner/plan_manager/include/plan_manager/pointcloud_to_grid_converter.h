@@ -4,6 +4,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_srvs/Trigger.h>
+#include <cstddef>
 #include <vector>
 
 // PCL
@@ -55,6 +56,8 @@ public:
                      vector<float>& normal_x_grid,
                      vector<float>& normal_y_grid,
                      vector<float>& normal_z_grid,
+                     vector<float>& obstacle_mask_grid,
+                     vector<float>& obstacle_height_grid,
                      int& grid_width, int& grid_height);
     
     // 分配点到栅格单元
@@ -67,6 +70,9 @@ public:
                         vector<float>& normal_x_grid,
                         vector<float>& normal_y_grid,
                         vector<float>& normal_z_grid,
+                        vector<float>& obstacle_mask_grid,
+                        vector<float>& obstacle_height_grid,
+                        const vector<float>& ground_reference_grid,
                         int width, int height);
 };
 

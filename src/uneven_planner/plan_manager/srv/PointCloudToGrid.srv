@@ -17,3 +17,5 @@ float32[] elevation_grid
 float32[] normal_x_grid
 float32[] normal_y_grid
 float32[] normal_z_grid
+float32[] obstacle_mask_grid
+float32[] obstacle_height_grid

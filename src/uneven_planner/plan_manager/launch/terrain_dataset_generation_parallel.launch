@@ -9,6 +9,8 @@
     <arg name="train_paths_per_env" default="200"/>
     <arg name="val_paths_per_env" default="20"/>
     <arg name="stop_after_train" default="false"/>
+    <arg name="start_phase" default="train"/>
+    <arg name="terminate_after_generator" default="false"/>
     <arg name="dataset_dir" default="$(find plan_manager)/datasets/dataset1_val"/>
     <arg name="start_env_id" default="20"/>
 
@@ -23,6 +25,34 @@
     <arg name="train_external_map_paths" default=""/>
     <arg name="val_external_map_paths" default=""/>
     <arg name="external_map_format" default="pcd"/>
+    <arg name="train_external_source_profile" default="als"/>
+    <arg name="val_external_source_profile" default="als"/>
+    <arg name="external_domain" default=""/>
+    <arg name="train_external_source_url" default=""/>
+    <arg name="val_external_source_url" default=""/>
+    <arg name="train_external_license" default=""/>
+    <arg name="val_external_license" default=""/>
+    <arg name="train_external_crs" default=""/>
+    <arg name="val_external_crs" default=""/>
+    <arg name="train_external_site_id" default=""/>
+    <arg name="val_external_site_id" default=""/>
+    <arg name="external_accepted_grades" default="easy,medium,hard"/>
+    <arg name="external_fit_radius" default="-1.0"/>
+    <arg name="external_surface_cell_size" default="-1.0"/>
+    <arg name="external_direct_fit_min_points" default="-1"/>
+    <arg name="external_ground_band_below" default="0.25"/>
+    <arg name="external_ground_band_above" default="0.35"/>
+    <arg name="external_envelope_outlier" default="0.75"/>
+    <arg name="external_planner_surface_resolution" default="0.05"/>
+    <arg name="external_raw_below_surface_tolerance" default="1.0"/>
+    <arg name="external_raw_above_surface_tolerance" default="50.0"/>
+    <arg name="external_above_surface_height" default="2.0"/>
+    <arg name="external_above_surface_cell_size" default="1.0"/>
+    <arg name="external_max_above_surface_coverage" default="1.0"/>
+    <arg name="external_min_above_surface_component_cells" default="0"/>
+    <arg name="external_tree_class_values" default="1"/>
+    <arg name="external_ground_class_values" default="2"/>
+    <arg name="external_min_tree_component_cells" default="0"/>
     <arg name="external_map_is_canonical" default="false"/>
     <arg name="canonical_maps_per_environment" default="1"/>
     <arg name="canonical_primary_scene_count" default="-1"/>
@@ -37,7 +67,7 @@
     <arg name="crop_rotation_max_deg" default="180.0"/>
     <arg name="crop_padding" default="1.0"/>
     <arg name="crop_min_points" default="50"/>
-    <arg name="crop_min_coverage" default="0.85"/>
+    <arg name="crop_min_coverage" default="0.97"/>
     <arg name="crop_max_attempts" default="50"/>
     <arg name="crop_random_seed" default="-1"/>
 

@@ -3,8 +3,10 @@ set -euo pipefail
 
 usage() {
     echo "Usage: $0 TRAIN.laz VAL.laz OUTPUT_DIR [SCENES [TRAIN_PATHS [VAL_PATHS]]]" >&2
-    echo "Environment: SEED=20260813 MAX_ATTEMPTS_PER_SPLIT=<default:30 per sampled candidate> ACCEPTED_GRADES=easy,medium,hard PARALLEL_WORKERS=1 CANONICAL_CANDIDATES_PER_ENV=2" >&2
-    echo "             TRAIN_SOURCE_PROFILE=uls VAL_SOURCE_PROFILE=uls TRAIN_POINT_CLASSES=2 VAL_POINT_CLASSES=2" >&2
+    echo "Environment: SEED=20260813 CROP_MIN_COVERAGE=0.97 CROP_MAX_ATTEMPTS=50 ACCEPTED_GRADES=easy,medium,hard PARALLEL_WORKERS=1" >&2
+    echo "             ABOVE_SURFACE_HEIGHT_M=2.0 ABOVE_SURFACE_CELL_SIZE_M=1.0 MAX_ABOVE_SURFACE_COVERAGE=1.0 MIN_ABOVE_SURFACE_COMPONENT_CELLS=0" >&2
+    echo "             TREE_CLASS_VALUES=1 GROUND_CLASS_VALUES=2 MIN_TREE_COMPONENT_CELLS=0" >&2
+    echo "             TRAIN_SOURCE_PROFILE=uls VAL_SOURCE_PROFILE=uls" >&2
     echo "             DOMAIN=... TRAIN_SITE_ID=... VAL_SITE_ID=... TRAIN_SOURCE_URL=... VAL_SOURCE_URL=..." >&2
     echo "             TRAIN_LICENSE=... VAL_LICENSE=... TRAIN_CRS=... VAL_CRS=..." >&2
 }
@@ -24,16 +26,23 @@ val_paths="${6:-1}"
 seed="${SEED:-20260813}"
 accepted_grades="${ACCEPTED_GRADES:-easy,medium,hard}"
 parallel_workers="${PARALLEL_WORKERS:-1}"
-canonical_candidates="${CANONICAL_CANDIDATES_PER_ENV:-2}"
+crop_min_coverage="${CROP_MIN_COVERAGE:-0.97}"
+crop_max_attempts="${CROP_MAX_ATTEMPTS:-50}"
+above_surface_height_m="${ABOVE_SURFACE_HEIGHT_M:-2.0}"
+above_surface_cell_size_m="${ABOVE_SURFACE_CELL_SIZE_M:-1.0}"
+max_above_surface_coverage="${MAX_ABOVE_SURFACE_COVERAGE:-1.0}"
+min_above_surface_component_cells="${MIN_ABOVE_SURFACE_COMPONENT_CELLS:-0}"
+tree_class_values="${TREE_CLASS_VALUES:-1}"
+ground_class_values="${GROUND_CLASS_VALUES:-2}"
+min_tree_component_cells="${MIN_TREE_COMPONENT_CELLS:-0}"
 poll_seconds="${POLL_SECONDS:-2}"
 # Full 100-scene releases can legitimately need several hours on difficult
 # terrain.  Keep the polling interval short but allow an eight-hour wall-clock
 # window by default; callers may still set a tighter test timeout explicitly.
 max_polls="${MAX_PIPELINE_POLLS:-14400}"
+resume_generation="${RESUME_GENERATION:-0}"
 train_source_profile="${TRAIN_SOURCE_PROFILE:-uls}"
 val_source_profile="${VAL_SOURCE_PROFILE:-uls}"
-train_point_classes="${TRAIN_POINT_CLASSES:-2}"
-val_point_classes="${VAL_POINT_CLASSES:-2}"
 train_source_url="${TRAIN_SOURCE_URL:-}"
 val_source_url="${VAL_SOURCE_URL:-}"
 train_license="${TRAIN_LICENSE:-}"
@@ -58,64 +67,26 @@ for source_path in "${train_laz}" "${val_laz}"; do
         exit 1
     fi
 done
-if [[ -e "${output_dir}" ]]; then
-    echo "Refusing to overwrite existing output: ${output_dir}" >&2
-    exit 1
-fi
-
 # roslaunch may change its working directory.  Resolve every externally visible
 # path before launching so sampling, ROS output, and the completion monitor all
 # refer to the same files.
 train_laz="$(realpath "${train_laz}")"
 val_laz="$(realpath "${val_laz}")"
 output_dir="$(realpath -m "${output_dir}")"
-scene_root="${output_dir}/sampled_scenes"
-train_scene_dir="${scene_root}/train"
-val_scene_dir="${scene_root}/val"
-trajectory_dir="${output_dir}/trajectories"
-
-mkdir -p "${train_scene_dir}" "${val_scene_dir}" "${trajectory_dir}"
-export MPLCONFIGDIR="${output_dir}/matplotlib"
-export ROS_LOG_DIR="${output_dir}/ros_logs"
-mkdir -p "${MPLCONFIGDIR}" "${ROS_LOG_DIR}"
-
-sampled_scenes=$((scenes * canonical_candidates))
-max_attempts="${MAX_ATTEMPTS_PER_SPLIT:-$((sampled_scenes * 30))}"
-
-python3 "${script_dir}/sample_laz_mother_map.py" \
-    "${train_laz}" "${train_scene_dir}" \
-    --accepted "${sampled_scenes}" \
-    --max-attempts "${max_attempts}" \
-    --seed "${seed}" \
-    --accepted-grades "${accepted_grades}" \
-    --source-profile "${train_source_profile}" \
-    --point-classes "${train_point_classes}" \
-    --source-url "${train_source_url}" \
-    --license "${train_license}" \
-    --crs "${train_crs}" \
-    --site-id "${train_site_id}" \
-    --domain "${domain}"
-
-python3 "${script_dir}/sample_laz_mother_map.py" \
-    "${val_laz}" "${val_scene_dir}" \
-    --accepted "${sampled_scenes}" \
-    --max-attempts "${max_attempts}" \
-    --seed "$((seed + 1))" \
-    --accepted-grades "${accepted_grades}" \
-    --source-profile "${val_source_profile}" \
-    --point-classes "${val_point_classes}" \
-    --source-url "${val_source_url}" \
-    --license "${val_license}" \
-    --crs "${val_crs}" \
-    --site-id "${val_site_id}" \
-    --domain "${domain}"
-
-train_maps="$(find "${train_scene_dir}" -maxdepth 1 -type f -name 'scene_*.pcd' ! -name '*_grid.pcd' -exec realpath {} \; | sort | paste -sd, -)"
-val_maps="$(find "${val_scene_dir}" -maxdepth 1 -type f -name 'scene_*.pcd' ! -name '*_grid.pcd' -exec realpath {} \; | sort | paste -sd, -)"
-if [[ -z "${train_maps}" || -z "${val_maps}" ]]; then
-    echo "Sampling completed without a usable train/val map list" >&2
+if [[ "${resume_generation}" == "1" ]]; then
+    if [[ ! -d "${output_dir}" ]]; then
+        echo "Resume requested but output is missing: ${output_dir}" >&2
+        exit 1
+    fi
+elif [[ -e "${output_dir}" ]]; then
+    echo "Refusing to overwrite existing output: ${output_dir}" >&2
     exit 1
 fi
+trajectory_dir="${output_dir}"
+ros_log_dir="${output_dir}.ros_logs"
+
+mkdir -p "${trajectory_dir}" "${ros_log_dir}"
+export ROS_LOG_DIR="${ros_log_dir}"
 
 source "${workspace}/devel/setup.bash"
 setsid roslaunch plan_manager terrain_dataset_generation_parallel.launch \
@@ -125,17 +96,35 @@ setsid roslaunch plan_manager terrain_dataset_generation_parallel.launch \
     val_paths_per_env:="${val_paths}" \
     dataset_dir:="${trajectory_dir}" \
     start_env_id:=0 \
-    external_map_path:="${train_maps%%,*}" \
-    external_map_paths:="${train_maps},${val_maps}" \
-    train_external_map_paths:="${train_maps}" \
-    val_external_map_paths:="${val_maps}" \
-    external_map_is_canonical:=true \
-    canonical_maps_per_environment:="${canonical_candidates}" \
-    canonical_primary_scene_count:="${scenes}" \
-    canonical_pool_start_env_id:=0 \
-    external_map_format:=pcd \
+    external_map_path:="${train_laz}" \
+    external_map_paths:="${train_laz},${val_laz}" \
+    train_external_map_paths:="${train_laz}" \
+    val_external_map_paths:="${val_laz}" \
+    external_map_is_canonical:=false \
+    external_map_format:=laz \
+    train_external_source_profile:="${train_source_profile}" \
+    val_external_source_profile:="${val_source_profile}" \
+    external_domain:="${domain}" \
+    train_external_source_url:="${train_source_url}" \
+    val_external_source_url:="${val_source_url}" \
+    train_external_license:="${train_license}" \
+    val_external_license:="${val_license}" \
+    train_external_crs:="${train_crs}" \
+    val_external_crs:="${val_crs}" \
+    train_external_site_id:="${train_site_id}" \
+    val_external_site_id:="${val_site_id}" \
+    external_accepted_grades:="${accepted_grades}" \
+    external_above_surface_height:="${above_surface_height_m}" \
+    external_above_surface_cell_size:="${above_surface_cell_size_m}" \
+    external_max_above_surface_coverage:="${max_above_surface_coverage}" \
+    external_min_above_surface_component_cells:="${min_above_surface_component_cells}" \
+    external_tree_class_values:="${tree_class_values}" \
+    external_ground_class_values:="${ground_class_values}" \
+    external_min_tree_component_cells:="${min_tree_component_cells}" \
     target_map_size:=20.0 \
     target_resolution:=0.2 \
+    crop_min_coverage:="${crop_min_coverage}" \
+    crop_max_attempts:="${crop_max_attempts}" \
     crop_random_seed:="${seed}" \
     generation_random_seed:="$((seed + 2))" \
     max_path_retries_before_regenerate:=12 &
@@ -177,12 +166,31 @@ count_completed_manifests() {
     echo "${count}"
 }
 
+count_failed_manifests() {
+    local manifest count=0
+    for manifest in "${trajectory_dir}"/experiment_manifest_worker_*.json; do
+        [[ -f "${manifest}" ]] || continue
+        if grep -q '"status": "failed"' "${manifest}"; then
+            count=$((count + 1))
+        fi
+    done
+    echo "${count}"
+}
+
 for ((poll=1; poll<=max_polls; poll++)); do
     train_map_count="$(count_outputs "${trajectory_dir}/train" map.p)"
     val_map_count="$(count_outputs "${trajectory_dir}/val" map.p)"
     train_path_count="$(count_outputs "${trajectory_dir}/train" 'path_*.p')"
     val_path_count="$(count_outputs "${trajectory_dir}/val" 'path_*.p')"
     completed_manifest_count="$(count_completed_manifests)"
+    failed_manifest_count="$(count_failed_manifests)"
+
+    if [[ "${failed_manifest_count}" -gt 0 ]]; then
+        stop_launch
+        trap - EXIT INT TERM
+        echo "ROS generation stopped after a worker reported failure: ${failed_manifest_count} worker(s)" >&2
+        exit 1
+    fi
 
     if [[ "${train_map_count}" -eq "${scenes}" &&
           "${val_map_count}" -eq "${scenes}" &&

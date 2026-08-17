@@ -24,7 +24,7 @@ def load_pickle(path, errors):
 
 
 def verify_split(root, split, scenes, paths_per_scene, expected_site, errors):
-    split_root = root / "trajectories" / split
+    split_root = root / split
     env_dirs = sorted(path for path in split_root.glob("env*" ) if path.is_dir())
     if len(env_dirs) != scenes:
         fail(errors, f"{split}: expected {scenes} environment directories, found {len(env_dirs)}")
@@ -56,8 +56,15 @@ def verify_split(root, split, scenes, paths_per_scene, expected_site, errors):
         else:
             valid_fraction = float(np.mean(valid_mask.astype(bool)))
             valid_fractions.append(valid_fraction)
-            if valid_fraction < 0.97:
-                fail(errors, f"{map_path}: valid fraction {valid_fraction:.4f} is below 0.97")
+            if valid_fraction < 1.0:
+                fail(errors, f"{map_path}: completed surface still contains invalid cells")
+
+        observed_mask = np.asarray(map_data.get("observed_mask"))
+        if observed_mask.shape != (100, 100):
+            fail(errors, f"{map_path}: observed_mask shape {observed_mask.shape}, expected (100, 100)")
+
+        if "obstacle_mask" in map_data or "obstacle_height" in map_data:
+            fail(errors, f"{map_path}: dataset map must not contain an obstacle layer")
 
         if map_data.get("dataset_phase") != split:
             fail(errors, f"{map_path}: dataset_phase is {map_data.get('dataset_phase')!r}, expected {split!r}")
@@ -119,10 +126,9 @@ def main():
         ),
     }
 
-    trajectory_root = args.dataset_root / "trajectories"
-    manifest_paths = sorted(trajectory_root.glob("experiment_manifest_worker_*.json"))
+    manifest_paths = sorted(args.dataset_root.glob("experiment_manifest_worker_*.json"))
     if not manifest_paths:
-        manifest_paths = [trajectory_root / "experiment_manifest.json"]
+        manifest_paths = [args.dataset_root / "experiment_manifest.json"]
     manifest_statuses = []
     manifest_environment_ids = set()
     for manifest_path in manifest_paths:

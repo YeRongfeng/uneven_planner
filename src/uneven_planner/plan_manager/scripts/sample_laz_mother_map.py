@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Sample and quality-gate metric 20 m scenes directly from a LAS/LAZ mother map.
 
-The source is loaded once, but no fixed crop list is required.  Candidate
-centres and yaw angles are sampled deterministically from classified ground
-surface returns.  Cheap density/coverage checks run before the robust 100 x 100 local
-plane fit.  Only Stage-A quality-passing scenes are retained; every attempted
-location and rejection reason is recorded in a manifest.
+The source is loaded once, but no fixed crop list is required. Candidate
+centres and yaw angles are sampled deterministically from raw source support.
+The continuous 100 x 100 grid is fitted from a geometry-only lower envelope,
+while the retained planner PCD contains that fitted surface together with all
+finite raw XYZ returns in the crop. No LAS class filter or obstacle layer is
+written. Only quality-passing scenes are retained; every attempted location
+and rejection reason is recorded in a manifest.
 """
 
 import argparse
 import datetime
+import glob
 import json
 import math
 import os
@@ -17,10 +20,14 @@ import sys
 
 import laspy
 import numpy as np
-from scipy.ndimage import map_coordinates
-
 from prepare_laz_terrain_map import (
     fit_grid,
+    fit_yrf_ground_grid,
+    geometry_ground_candidates,
+    measure_above_surface_coverage,
+    measure_classified_above_surface_coverage,
+    retain_raw_returns,
+    resample_completed_surface,
     save_preview,
     write_binary_pcd,
 )
@@ -39,26 +46,38 @@ def file_record(path):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input_laz", help="Classified LAS/LAZ mother map")
+    parser.add_argument("input_laz", help="Raw LAS/LAZ mother map")
     parser.add_argument("output_dir", help="Retained scene and manifest directory")
     parser.add_argument("--accepted", type=int, default=5,
                         help="Number of quality-passing scenes to retain")
     parser.add_argument("--max-attempts", type=int, default=40)
     parser.add_argument("--seed", type=int, default=20260813)
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Continue an existing sampling manifest in output_dir")
     parser.add_argument("--size", type=float, default=20.0)
     parser.add_argument("--resolution", type=float, default=0.2)
     parser.add_argument("--planner-surface-resolution", type=float, default=0.05,
                         help="Dense fitted-surface spacing used by UnevenMap")
+    parser.add_argument("--raw-below-surface-tolerance", type=float, default=1.0,
+                        help="Discard raw returns more than this far below the fitted surface (m)")
+    parser.add_argument("--raw-above-surface-tolerance", type=float, default=50.0,
+                        help="Discard raw returns more than this far above the fitted surface (m)")
     parser.add_argument(
         "--source-profile", choices=("uls", "als"), default="uls",
         help="Acquisition-density profile; controls explicit fitting defaults")
-    parser.add_argument(
-        "--point-classes", default="2",
-        help="Comma-separated LAS classes used as the terrain surface (normally 2; use 1 only when source metadata says the cloud is an unclassified bare surface)")
     parser.add_argument("--fit-radius", type=float, default=None,
-                        help="Robust local-plane radius; defaults to 0.35 m for ULS and 0.9 m for ALS")
-    parser.add_argument("--min-neighbors", type=int, default=None)
-    parser.add_argument("--max-rmse", type=float, default=0.12)
+                        help="Local-plane radius; defaults to 0.35 m for ULS and 0.9 m for ALS")
+    parser.add_argument("--surface-cell-size", type=float, default=None,
+                        help="Coarse XY cell for geometry-only lower-envelope ground extraction")
+    parser.add_argument("--ground-band-below", type=float, default=0.25,
+                        help="Ground candidate tolerance below the lower envelope (m)")
+    parser.add_argument("--ground-band-above", type=float, default=0.35,
+                        help="Ground candidate tolerance above the lower envelope (m)")
+    parser.add_argument("--envelope-outlier", type=float, default=0.75,
+                        help="Local lower-envelope outlier threshold (m)")
+    parser.add_argument("--direct-fit-min-points", type=int, default=None,
+                        help="Minimum points for a directly observed local fit")
     parser.add_argument("--min-density", type=float, default=None)
     parser.add_argument("--coverage-resolution", type=float, default=None,
                         help="Cell size for checking source support before fitting")
@@ -85,30 +104,22 @@ def parse_args():
     profile_defaults = {
         "uls": {
             "fit_radius": 0.35,
-            "min_neighbors": 8,
+            "direct_fit_min_points": 8,
             "min_density": 40.0,
             "coverage_resolution": 0.2,
+            "surface_cell_size": 0.5,
         },
         "als": {
             "fit_radius": 0.9,
-            "min_neighbors": 5,
+            "direct_fit_min_points": 5,
             "min_density": 4.0,
             "coverage_resolution": 1.0,
+            "surface_cell_size": 1.0,
         },
     }[args.source_profile]
     for name, value in profile_defaults.items():
         if getattr(args, name) is None:
             setattr(args, name, value)
-    try:
-        args.point_classes = sorted({
-            int(value.strip()) for value in args.point_classes.split(",")
-            if value.strip()
-        })
-    except ValueError as exc:
-        raise ValueError("point-classes must be comma-separated integers") from exc
-    if (not args.point_classes
-            or any(value < 0 or value > 255 for value in args.point_classes)):
-        raise ValueError("point-classes must contain LAS classes from 0 to 255")
     args.accepted_grades = [
         value.strip() for value in args.accepted_grades.split(",")
         if value.strip()
@@ -122,8 +133,18 @@ def parse_args():
     return args
 
 
-def load_surface_points(path, point_classes):
+def load_surface_points(path, return_classification=False):
+    """Load all finite XYZ returns and optionally aligned LAS classes.
+
+    Runtime ROS clouds do not carry LAS classification, so the release sampler
+    must see the same raw geometry. Classification counts are kept in the
+    manifest for source description and offline diagnostics, never for
+    selecting the retained raw returns. When requested, the per-return labels
+    are returned in the same order as the finite XYZ array for crop-level
+    diagnostics.
+    """
     chunks = []
+    classification_chunks = []
     class_counts = np.zeros(256, dtype=np.int64)
     with laspy.open(path) as reader:
         source_count = int(reader.header.point_count)
@@ -132,24 +153,29 @@ def load_surface_points(path, point_classes):
             "maximum": reader.header.maxs.astype(float).tolist(),
         }
         for points in reader.chunk_iterator(2_000_000):
-            classification = np.asarray(points.classification, dtype=np.int64)
+            # LAS classification is an unsigned byte.  Keep the aligned
+            # source label array compact; crop-level metrics widen only the
+            # small selected slice when they need integer operations.
+            classification = np.asarray(points.classification, dtype=np.uint8)
             class_counts += np.bincount(classification, minlength=256)
-            selected = np.isin(classification, point_classes)
-            if not np.any(selected):
-                continue
             xyz = np.column_stack((
-                np.asarray(points.x)[selected],
-                np.asarray(points.y)[selected],
-                np.asarray(points.z)[selected],
+                np.asarray(points.x),
+                np.asarray(points.y),
+                np.asarray(points.z),
             ))
             finite = np.isfinite(xyz).all(axis=1)
             if np.any(finite):
                 chunks.append(xyz[finite])
+                classification_chunks.append(classification[finite])
     if not chunks:
-        raise RuntimeError(
-            f"Mother map contains no finite points in classes {point_classes}")
-    return (np.concatenate(chunks), source_count, source_bounds,
-            {str(i): int(value) for i, value in enumerate(class_counts) if value})
+        raise RuntimeError("Mother map contains no finite XYZ points")
+    points = np.concatenate(chunks)
+    metadata = (
+        points, source_count, source_bounds,
+        {str(i): int(value) for i, value in enumerate(class_counts) if value})
+    if return_classification:
+        return metadata + (np.concatenate(classification_chunks),)
+    return metadata
 
 
 def select_local_points(all_ground, center, yaw, size, margin):
@@ -189,61 +215,75 @@ def grid_coverage(points, size, resolution):
 
 
 def build_surface(exact, padded, args):
-    local_x, local_y, elevation, normals, valid, rmse, neighbors = fit_grid(
-        padded, 0.0, 0.0, args.size, args.resolution,
-        args.fit_radius, args.min_neighbors, args.max_rmse)
+    fit_method = getattr(args, "fit_method", "local_plane")
+    if fit_method == "yrf_ground":
+        (local_x, local_y, elevation, normals, valid, observed, neighbors,
+         split_diagnostics) = fit_yrf_ground_grid(
+            padded,
+            args.size,
+            args.resolution,
+            coarse_resolution=args.yrf_coarse_resolution,
+            voxel_size=args.yrf_voxel_size,
+            ground_below=args.ground_band_below,
+            ground_above=args.ground_band_above,
+            envelope_outlier=args.envelope_outlier,
+            lower_envelope_filter_size=args.yrf_lower_envelope_filter_size,
+        )
+        ground_candidate_count = split_diagnostics["ground_candidate_count"]
+    else:
+        ground_points, _, _, split_diagnostics = geometry_ground_candidates(
+            padded,
+            args.size,
+            args.fit_radius,
+            cell_size=args.surface_cell_size,
+            ground_below=args.ground_band_below,
+            ground_above=args.ground_band_above,
+            envelope_outlier=args.envelope_outlier,
+        )
+        local_x, local_y, elevation, normals, valid, observed, neighbors = fit_grid(
+            ground_points, 0.0, 0.0, args.size, args.resolution,
+            args.fit_radius, args.direct_fit_min_points)
+        ground_candidate_count = len(ground_points)
 
-    # UnevenMap estimates a local covariance directly from the PCD. Feeding it
-    # raw classified returns makes its surface differ from the robust grid used
-    # by the quality gate and the network. Resample that fitted surface densely
-    # instead, so all three consumers see the same geometry while UnevenMap
-    # still has enough points in each ellipsoid neighbourhood.
-    planner_cells_float = args.size / args.planner_surface_resolution
-    planner_cells = int(round(planner_cells_float))
-    if not math.isclose(planner_cells_float, planner_cells,
-                        rel_tol=0.0, abs_tol=1e-8):
-        raise ValueError(
-            "size must be an integer multiple of planner-surface-resolution")
-    planner_axis = (-0.5 * args.size
-                    + (np.arange(planner_cells) + 0.5)
-                    * args.planner_surface_resolution)
-    planner_x, planner_y = np.meshgrid(planner_axis, planner_axis)
-    first_center = -0.5 * args.size + 0.5 * args.resolution
-    columns = (planner_x.ravel() - first_center) / args.resolution
-    rows = (planner_y.ravel() - first_center) / args.resolution
-    coordinates = np.vstack((rows, columns))
-    dense_valid = map_coordinates(
-        valid.astype(np.uint8), coordinates, order=0,
-        mode="nearest").astype(bool)
-    coordinates = coordinates[:, dense_valid]
-    dense_xyz = np.column_stack((
-        planner_x.ravel()[dense_valid],
-        planner_y.ravel()[dense_valid],
-        map_coordinates(elevation, coordinates, order=1, mode="nearest"),
-    ))
-    dense_normals = np.column_stack([
-        map_coordinates(normals[:, :, component], coordinates,
-                        order=1, mode="nearest")
-        for component in range(3)
-    ])
-    dense_normals /= np.maximum(
-        np.linalg.norm(dense_normals, axis=1, keepdims=True), 1e-12)
+    # UnevenMap estimates a local covariance directly from the PCD. Keep a
+    # dense fitted surface for stable support, and append every raw return in
+    # the crop so above-ground geometry is not discarded before runtime mask
+    # handling exists.
+    dense_xyz, dense_normals = resample_completed_surface(
+        elevation, normals, valid, args.size, args.resolution,
+        args.planner_surface_resolution)
 
-    vertical_origin = float(min(np.min(elevation[valid]), np.min(dense_xyz[:, 2])))
+    raw_xyz = retain_raw_returns(
+        np.asarray(exact, dtype=np.float64), elevation, args.size,
+        args.resolution, args.raw_below_surface_tolerance,
+        args.raw_above_surface_tolerance)
+    raw_normals = np.zeros_like(raw_xyz)
+    vertical_origin = float(min(
+        np.min(elevation[valid]), np.min(dense_xyz[:, 2])))
     elevation -= vertical_origin
     dense_xyz[:, 2] -= vertical_origin
+    raw_xyz[:, 2] -= vertical_origin
+    planner_xyz = np.vstack((dense_xyz, raw_xyz))
+    planner_normals = np.vstack((dense_normals, raw_normals))
     return {
         "local_x": local_x,
         "local_y": local_y,
         "elevation": elevation,
         "normals": normals,
         "valid": valid,
-        "rmse": rmse,
+        "observed": observed,
         "neighbors": neighbors,
         "dense_xyz": dense_xyz,
         "dense_normals": dense_normals,
+        "raw_xyz": raw_xyz,
+        "raw_normals": raw_normals,
+        "planner_xyz": planner_xyz,
+        "planner_normals": planner_normals,
         "vertical_origin": vertical_origin,
         "consistent_fraction": 1.0,
+        "ground_candidate_count": int(ground_candidate_count),
+        "split_diagnostics": split_diagnostics,
+        "fit_method": fit_method,
     }
 
 
@@ -252,6 +292,49 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
     valid = surface["valid"]
     normals = surface["normals"]
     slope = np.degrees(np.arccos(np.clip(normals[:, :, 2], -1.0, 1.0)))
+    fit_method = surface.get("fit_method", "local_plane")
+    processing = {
+        "source_profile": args.source_profile,
+        "surface_source": "all finite XYZ returns; no LAS class filtering; gross below-surface outliers removed",
+        "sampling": (
+            "uniform occupied source-area cell with within-cell jitter and random yaw"
+            if args.center_sampling == "uniform_support"
+            else "random selected-surface point centre and random yaw"),
+        "center_sampling_resolution_m": args.center_sampling_resolution,
+        "surface_cell_size_m": args.surface_cell_size,
+        "ground_band_below_m": args.ground_band_below,
+        "ground_band_above_m": args.ground_band_above,
+        "envelope_outlier_m": args.envelope_outlier,
+        "fit_radius_m": args.fit_radius,
+        "direct_fit_minimum_points": args.direct_fit_min_points,
+        "planner_surface_resolution_m": args.planner_surface_resolution,
+        "raw_below_surface_tolerance_m": args.raw_below_surface_tolerance,
+        "raw_above_surface_tolerance_m": args.raw_above_surface_tolerance,
+        "axis_scaling": "none",
+        "xy_output": "translated and rotated only",
+        "z_output": "source elevation minus retained patch minimum",
+        "planner_pcd": "dense completed fitted surface plus supported raw XYZ returns",
+    }
+    if fit_method == "yrf_ground":
+        processing.update({
+            "ground_fit_support": (
+                "YRF 0.2m voxel centroids + 0.4m lower envelope + 3x3 "
+                "upper-median reference + ground-band median"),
+            "fit": "YRF-compatible coarse ground reference and cubic elevation interpolation",
+            "yrf_voxel_size_m": args.yrf_voxel_size,
+            "yrf_coarse_resolution_m": args.yrf_coarse_resolution,
+            "yrf_lower_envelope_filter_size": (
+                args.yrf_lower_envelope_filter_size),
+            "gap_completion": (
+                "coarse unsupported-cell completion followed by cubic elevation interpolation"),
+        })
+    else:
+        processing.update({
+            "ground_fit_support": "coarse lower envelope + local median outlier removal + height band",
+            "fit": "distance-weighted local plane with non-rejecting MAD refinement on geometry-only ground candidates",
+            "gap_completion": (
+                "harmonic elevation fill followed by finite-difference normals"),
+        })
     return {
         "domain": args.domain,
         "site_id": args.site_id,
@@ -267,17 +350,24 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
         "patch_size_m": args.size,
         "resolution_m": args.resolution,
         "grid_shape": list(surface["elevation"].shape),
-        "source_surface_classes": args.point_classes,
-        "source_surface_points_in_patch": int(exact_count),
-        "source_surface_density_points_per_m2": float(
+        "source_surface": "all_finite_XYZ_no_LAS_class_filter",
+        "surface_fit_method": fit_method,
+        "source_raw_points_in_patch": int(exact_count),
+        "raw_returns_retained_in_planner_pcd": int(len(surface["raw_xyz"])),
+        "source_raw_density_points_per_m2": float(
             exact_count / (args.size ** 2)),
+        "ground_candidate_points_in_patch": int(
+            surface["ground_candidate_count"]),
+        "ground_candidate_density_points_per_m2": float(
+            surface["ground_candidate_count"] / (args.size ** 2)),
         "source_support_coverage": float(support_coverage),
         "source_support_resolution_m": float(args.coverage_resolution),
-        "planner_point_count": int(len(surface["dense_xyz"])),
+        "planner_point_count": int(len(surface["planner_xyz"])),
         "planner_point_density_points_per_m2": float(
-            len(surface["dense_xyz"]) / (args.size ** 2)),
+            len(surface["planner_xyz"]) / (args.size ** 2)),
         "planner_surface_consistent_fraction": float(surface["consistent_fraction"]),
         "valid_fraction": float(valid.mean()),
+        "observed_fraction": float(surface["observed"].mean()),
         "vertical_origin_m": surface["vertical_origin"],
         "elevation_range_m": [
             float(np.min(surface["elevation"])),
@@ -288,29 +378,7 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
             "p95": float(np.quantile(slope[valid], 0.95)),
             "maximum": float(np.max(slope[valid])),
         },
-        "fit_rmse_m": {
-            "median": float(np.nanmedian(surface["rmse"])),
-            "p95": float(np.nanquantile(surface["rmse"], 0.95)),
-            "maximum": float(np.nanmax(surface["rmse"])),
-        },
-        "processing": {
-            "source_profile": args.source_profile,
-            "surface_classes": args.point_classes,
-            "sampling": (
-                "uniform occupied source-area cell with within-cell jitter and random yaw"
-                if args.center_sampling == "uniform_support"
-                else "random selected-surface point centre and random yaw"),
-            "center_sampling_resolution_m": args.center_sampling_resolution,
-            "fit": "distance-weighted local plane with MAD rejection",
-            "fit_radius_m": args.fit_radius,
-            "min_neighbors": args.min_neighbors,
-            "max_rmse_m": args.max_rmse,
-            "planner_surface_resolution_m": args.planner_surface_resolution,
-            "axis_scaling": "none",
-            "xy_output": "translated and rotated only",
-            "z_output": "source elevation minus retained patch minimum",
-            "planner_pcd": "dense bilinear resampling of robust fitted surface",
-        },
+        "processing": processing,
     }
 
 
@@ -323,7 +391,7 @@ def save_npz(path, surface, args, center, yaw):
         normal_y=normals[:, :, 1].astype(np.float32),
         normal_z=normals[:, :, 2].astype(np.float32),
         valid_mask=surface["valid"],
-        fit_rmse=surface["rmse"].astype(np.float32),
+        observed_mask=surface["observed"],
         fit_neighbors=surface["neighbors"],
         resolution=np.float32(args.resolution),
         size=np.float32(args.size),
@@ -333,28 +401,129 @@ def save_npz(path, surface, args, center, yaw):
     )
 
 
+def write_sampling_manifest(output_dir, input_path, source_info, args,
+                            records, accepted_centers):
+    """Checkpoint accepted sampling progress so long runs can resume."""
+    manifest = {
+        "policy": "terrain20m-v4-base4-rawpcd",
+        "created_utc": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
+        "source_file": os.path.abspath(input_path),
+        "source": file_record(input_path),
+        "dependency_versions": {
+            "laspy": laspy.__version__,
+            "numpy": np.__version__,
+        },
+        "seed": args.seed,
+        "requested_accepted_scenes": args.accepted,
+        "accepted_scenes": len(accepted_centers),
+        "attempts_used": len(records),
+        "parameters": vars(args),
+        "records": records,
+    }
+    manifest_path = os.path.join(output_dir, "sampling_manifest.json")
+    temporary_path = manifest_path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+    os.replace(temporary_path, manifest_path)
+
+
 def main():
     args = parse_args()
     if args.accepted <= 0 or args.max_attempts <= 0:
         raise ValueError("accepted and max-attempts must be positive")
     os.makedirs(args.output_dir, exist_ok=True)
-    print("Loading selected terrain-surface returns from mother map...", flush=True)
-    ground, source_count, source_bounds, class_counts = load_surface_points(
-        args.input_laz, args.point_classes)
+    print("Loading raw XYZ returns from mother map...", flush=True)
+    raw_points, source_count, source_bounds, class_counts = load_surface_points(
+        args.input_laz)
     print(
-        f"Loaded {len(ground)} points from LAS classes {args.point_classes}",
+        f"Loaded {len(raw_points)} finite raw XYZ points; LAS classes are not used",
         flush=True)
     source_info = (source_count, source_bounds, class_counts)
     rng = np.random.default_rng(args.seed)
     accepted_centers = []
     records = []
+    first_attempt = 1
+    if args.resume:
+        manifest_path = os.path.join(args.output_dir, "sampling_manifest.json")
+        current_source = os.path.abspath(args.input_laz)
+        if os.path.isfile(manifest_path):
+            with open(manifest_path, encoding="utf-8") as stream:
+                previous_manifest = json.load(stream)
+            previous_source = os.path.abspath(
+                previous_manifest.get("source_file", ""))
+            if previous_source != current_source:
+                raise ValueError(
+                    "Resume source does not match the existing manifest: "
+                    f"{previous_source} != {current_source}")
+            records = list(previous_manifest.get("records", []))
+            accepted_records = [
+                record for record in records
+                if record.get("status") == "accepted"
+            ]
+            accepted_centers = [
+                np.asarray(record["center_xy"], dtype=np.float64)
+                for record in accepted_records
+            ]
+            scene_files = glob.glob(os.path.join(args.output_dir, "scene_*.json"))
+            if len(scene_files) != len(accepted_centers):
+                raise ValueError(
+                    "Resume scene files do not match accepted manifest records: "
+                    f"{len(scene_files)} != {len(accepted_centers)}")
+            if records:
+                first_attempt = max(
+                    int(record["attempt"]) for record in records) + 1
+            print(
+                f"Resuming {len(accepted_centers)} accepted scenes at attempt "
+                f"{first_attempt}", flush=True)
+        else:
+            # A run interrupted before the first checkpoint can still reuse
+            # its completed scene files. Start a fresh deterministic candidate
+            # stream and keep the existing centres for separation checks.
+            scene_files = sorted(
+                glob.glob(os.path.join(args.output_dir, "scene_*.json")))
+            if not scene_files:
+                raise FileNotFoundError(
+                    f"Cannot resume without a manifest or scene files: "
+                    f"{manifest_path}")
+            for scene_path in scene_files:
+                with open(scene_path, encoding="utf-8") as stream:
+                    scene_metadata = json.load(stream)
+                center_xy = scene_metadata.get("source_center_xy")
+                if not isinstance(center_xy, list) or len(center_xy) != 2:
+                    raise ValueError(
+                        f"Existing scene is missing source_center_xy: {scene_path}")
+                records.append({
+                    "attempt": 0,
+                    "center_xy": [float(center_xy[0]), float(center_xy[1])],
+                    "yaw_deg": float(scene_metadata.get("crop_yaw_deg", 0.0)),
+                    "status": "accepted",
+                    "scene": os.path.splitext(
+                        os.path.basename(scene_path))[0],
+                    "reasons": [],
+                    "quality": scene_metadata.get("quality", {}),
+                })
+                accepted_centers.append(
+                    np.asarray(center_xy, dtype=np.float64))
+            print(
+                f"Resuming {len(accepted_centers)} existing scenes without a "
+                "manifest; starting a fresh candidate stream at attempt 1",
+                flush=True)
+        if len(accepted_centers) >= args.accepted:
+            print(
+                "Resume already satisfies the requested accepted-scene count; "
+                "no new candidates will be sampled.",
+                flush=True,
+            )
+            return 0
 
     # A rotated square reaches half_size*sqrt(2) from its centre. Use occupied
     # source-area cells inside that envelope as the sampling frame. Uniform
     # selection over cells avoids weighting centres by local point density;
     # the crop-level coverage gate still handles internal holes.
-    surface_xy_min = np.min(ground[:, :2], axis=0)
-    surface_xy_max = np.max(ground[:, :2], axis=0)
+    surface_xy_min = np.min(raw_points[:, :2], axis=0)
+    surface_xy_max = np.max(raw_points[:, :2], axis=0)
     center_margin = 0.5 * args.size * math.sqrt(2.0) + args.fit_radius
     support_cells = None
     support_origin = None
@@ -364,7 +533,7 @@ def main():
         sampling_resolution = args.center_sampling_resolution
         support_origin = np.floor(surface_xy_min / sampling_resolution) * sampling_resolution
         support_indices = np.floor(
-            (ground[:, :2] - support_origin) / sampling_resolution
+            (raw_points[:, :2] - support_origin) / sampling_resolution
         ).astype(np.int64)
         width = int(support_indices[:, 0].max()) + 1
         linear = np.unique(
@@ -387,14 +556,24 @@ def main():
             f"{sampling_resolution:g}m centre-sampling cells",
             flush=True)
 
-    for attempt in range(1, args.max_attempts + 1):
+    # Recreate the RNG state at the first unrecorded attempt. Each historical
+    # attempt consumes one centre draw and one yaw draw in this loop.
+    for _ in range(first_attempt - 1):
+        if args.center_sampling == "uniform_support":
+            rng.integers(0, len(support_cells))
+            rng.random(2)
+        else:
+            rng.integers(0, len(raw_points))
+        rng.uniform(-math.pi, math.pi)
+
+    for attempt in range(first_attempt, args.max_attempts + 1):
         if args.center_sampling == "uniform_support":
             cell = support_cells[int(rng.integers(0, len(support_cells)))]
             center = support_origin + (
                 cell.astype(np.float64) + rng.random(2)) \
                 * args.center_sampling_resolution
         else:
-            center = ground[int(rng.integers(0, len(ground))), :2]
+            center = raw_points[int(rng.integers(0, len(raw_points))), :2]
         yaw = float(rng.uniform(-math.pi, math.pi))
         record = {
             "attempt": attempt,
@@ -410,12 +589,12 @@ def main():
                 continue
 
         exact, padded = select_local_points(
-            ground, center, yaw, args.size, args.fit_radius)
+            raw_points, center, yaw, args.size, args.fit_radius)
         density = len(exact) / (args.size ** 2)
         coverage = grid_coverage(
             exact, args.size, args.coverage_resolution) if len(exact) else 0.0
         record.update(
-            ground_points=int(len(exact)),
+            raw_points=int(len(exact)),
             density_points_per_m2=float(density),
             raw_grid_coverage=float(coverage),
         )
@@ -448,7 +627,13 @@ def main():
             json.dump(metadata, stream, indent=2, ensure_ascii=False)
             stream.write("\n")
         quality = evaluate(temporary_npz)
-        record["quality"] = quality
+        quality_record = dict(quality)
+        quality_record.pop("path", None)
+        record["quality"] = quality_record
+        metadata["quality"] = quality_record
+        with open(temporary_json, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
         if quality["quality"] != "pass":
             record.update(status="quality_reject", reasons=quality["reasons"])
             records.append(record)
@@ -468,13 +653,12 @@ def main():
                 f"attempt {attempt}: grade reject {quality['grade']}",
                 flush=True)
             continue
-
         scene_index = len(accepted_centers)
         stem = os.path.join(args.output_dir, f"scene_{scene_index:03d}")
         os.replace(temporary_npz, stem + ".npz")
         os.replace(temporary_json, stem + ".json")
         write_binary_pcd(
-            stem + ".pcd", surface["dense_xyz"], surface["dense_normals"])
+            stem + ".pcd", surface["planner_xyz"], surface["planner_normals"])
         grid_xyz = np.column_stack((
             surface["local_x"].ravel(), surface["local_y"].ravel(),
             surface["elevation"].ravel()))
@@ -482,7 +666,7 @@ def main():
             stem + "_grid.pcd", grid_xyz, surface["normals"].reshape(-1, 3))
         save_preview(
             stem + "_preview.png", surface["elevation"], surface["normals"],
-            surface["valid"], surface["rmse"], args.size)
+            surface["neighbors"], args.size)
         record.update(
             status="accepted",
             scene=os.path.basename(stem),
@@ -494,30 +678,16 @@ def main():
             f"attempt {attempt}: accepted {record['scene']} "
             f"grade={quality['grade']} score={quality['geometry_score']:.1f}",
             flush=True)
+        write_sampling_manifest(
+            args.output_dir, args.input_laz, source_info, args,
+            records, accepted_centers)
         if len(accepted_centers) >= args.accepted:
             break
 
-    manifest = {
-        "policy": "terrain20m-v2",
-        "created_utc": datetime.datetime.now(
-            datetime.timezone.utc).isoformat(),
-        "source_file": os.path.abspath(args.input_laz),
-        "source": file_record(args.input_laz),
-        "dependency_versions": {
-            "laspy": laspy.__version__,
-            "numpy": np.__version__,
-        },
-        "seed": args.seed,
-        "requested_accepted_scenes": args.accepted,
-        "accepted_scenes": len(accepted_centers),
-        "attempts_used": len(records),
-        "parameters": vars(args),
-        "records": records,
-    }
+    write_sampling_manifest(
+        args.output_dir, args.input_laz, source_info, args,
+        records, accepted_centers)
     manifest_path = os.path.join(args.output_dir, "sampling_manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as stream:
-        json.dump(manifest, stream, indent=2, ensure_ascii=False)
-        stream.write("\n")
     print(json.dumps({
         "manifest": manifest_path,
         "accepted": len(accepted_centers),

@@ -62,13 +62,12 @@ for index in "${!terrains[@]}"; do
         exit 1
     fi
 
-    mkdir -p "${partial_dir}" "${terrain_log_dir}/ros" "${terrain_log_dir}/matplotlib"
+    mkdir -p "${partial_dir}" "${terrain_log_dir}/ros"
     echo "[$(date '+%F %T')] Starting ${terrain}: train=100x100 paths, val=100x10 paths"
 
     setsid env \
         ROS_MASTER_URI="http://localhost:11321" \
         ROS_LOG_DIR="${terrain_log_dir}/ros" \
-        MPLCONFIGDIR="${terrain_log_dir}/matplotlib" \
         roslaunch plan_manager terrain_dataset_generation_parallel.launch \
         parallel_workers:="${parallel_workers}" \
         num_environments:="${train_scenes}" \

@@ -1,7 +1,7 @@
 {
-  "manifest_version": "public-mother-map-release-candidate-v1",
-  "created_date": "2026-08-13",
-  "policy": "terrain20m-v2",
+  "manifest_version": "public-mother-map-release-candidate-v2",
+  "created_date": "2026-08-14",
+  "policy": "terrain20m-v3-continuous",
   "requested_dataset": {
     "domains": ["desert", "forest", "hill", "snow", "volcano"],
     "train_scenes_per_domain": 100,
@@ -17,9 +17,18 @@
     "minimum_center_separation_m": 20.0,
     "accepted_grades": ["easy", "medium", "hard"],
     "source_profile": "als",
-    "point_classes": [2],
+    "surface_source": "all_finite_xyz_returns",
+    "ground_split": "geometry_only_lower_envelope",
     "fit_radius_m": 0.9,
-    "minimum_neighbors": 5,
+    "direct_fit_minimum_points": 5,
+    "surface_cell_size_m": 1.0,
+    "ground_band_m": [-0.25, 0.35],
+    "envelope_outlier_m": 0.75,
+    "obstacle_height_band_m": [0.25, 2.0],
+    "obstacle_min_points_per_cell": 1,
+    "forest_minimum_obstacle_cells": 10,
+    "nonplanarity_rejection": "none; MAD only refines a fit and never invalidates a cell",
+    "gap_completion": "harmonic elevation fill followed by finite-difference normals",
     "minimum_source_density_points_per_m2": 4.0,
     "source_support_resolution_m": 1.0,
     "minimum_source_support_fraction": 0.97,
@@ -65,6 +74,7 @@
     {"split": "val", "domain": "snow", "accepted": 20, "attempts": 239, "grades": {"easy": 2, "medium": 18, "hard": 0}},
     {"split": "val", "domain": "volcano", "accepted": 20, "attempts": 58, "grades": {"easy": 0, "medium": 4, "hard": 16}}
   ],
+  "scale20_results_policy": "historical_class2_pipeline; rerun after obstacle-aware runtime integration",
   "stage_c": {
     "independent_validation_maps_completed": 15,
     "independent_validation_maps_total": 15,
@@ -99,9 +109,10 @@
     "output": "dataset/tests/release_pipeline_parallel8_forest_20260813/forest"
   },
   "release_requirements": {
-    "rotate_valid_mask_with_map_and_trajectory": true,
-    "mask_invalid_cells_in_training_loss_and_features": true,
+    "preserve_observed_mask_in_sampled_map_sidecars": true,
+    "preserve_obstacle_mask_and_height_in_map_sidecars": true,
+    "network_and_planner_maps_must_be_finite": true,
     "fixed_deterministic_validation_transform": true,
-    "full_run_status": "ready"
+    "full_run_status": "blocked_on_obstacle_aware_yrf_runtime_and_model_retraining"
   }
 }

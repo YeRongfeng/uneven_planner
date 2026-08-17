@@ -2,7 +2,7 @@
 
 ## Candidate
 
-`desert_sandhausen_zugmantel_candidate_001`
+`dune_sandhausen_zugmantel_candidate_001`
 
 - Contract: 20 m x 20 m, 0.2 m, 100 x 100.
 - Audited valid grid: 97.73%.

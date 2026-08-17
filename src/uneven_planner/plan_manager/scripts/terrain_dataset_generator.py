@@ -55,13 +55,20 @@ import math
 import time
 import os
 import sys
+import tempfile
 import json
 import datetime
 import pickle
 import glob
+from types import SimpleNamespace
 import cv2
 import tf.transformations as tf_trans
-from scipy.ndimage import gaussian_filter, zoom, label as connected_component_label
+from scipy.ndimage import (
+    gaussian_filter,
+    zoom,
+    map_coordinates,
+    label as connected_component_label,
+)
 from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
 from scipy.special import comb
@@ -70,11 +77,34 @@ from stability_validation import (
     build_periodic_signed_stability_esdf,
     validate_trajectory_stability,
 )
+from sample_laz_mother_map import (
+    build_surface,
+    load_surface_points,
+    measure_above_surface_coverage,
+    measure_classified_above_surface_coverage,
+)
+from terrain_map_quality import evaluate as evaluate_terrain_map
 
 # ROS消息类型
 from geometry_msgs.msg import PoseStamped
 from mpc_controller.msg import SE2Traj
 from std_msgs.msg import Bool
+
+
+def parse_las_class_values(value, parameter_name):
+    """Parse one or more LAS classification codes from ROS parameters."""
+    if isinstance(value, str):
+        values = value.replace(';', ',').split(',')
+    elif np.isscalar(value):
+        values = (value,)
+    else:
+        values = value
+    result = tuple(int(item) for item in values if str(item).strip())
+    if not result:
+        raise ValueError(f"{parameter_name} must contain at least one class code")
+    if any(item < 0 for item in result):
+        raise ValueError(f"{parameter_name} must contain non-negative class codes")
+    return result
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import OccupancyGrid, MapMetaData
 import sensor_msgs.point_cloud2 as pc2
@@ -1467,6 +1497,10 @@ class TerrainDatasetGenerator:
             rospy.get_param('~stop_after_train', False))
         self.dataset_dir = rospy.get_param('~dataset_dir', 'dataset')
         self.start_env_id = rospy.get_param('~start_env_id', 0)
+        self.start_phase = str(rospy.get_param(
+            '~start_phase', 'train')).strip().lower()
+        if self.start_phase not in ('train', 'val'):
+            raise ValueError("start_phase must be 'train' or 'val'")
         
         # 外部地图参数
         self.use_external_map = rospy.get_param('~use_external_map', False)
@@ -1504,7 +1538,84 @@ class TerrainDatasetGenerator:
             self.train_external_map_paths = self.external_map_paths
             self.val_external_map_paths = self.external_map_paths
         self.current_external_map_index = None
-        self.external_map_format = rospy.get_param('~external_map_format', 'pcd')  # 支持 'pcd', 'ply', 'txt', 'heightmap'
+        self.external_map_format = rospy.get_param(
+            '~external_map_format', 'pcd')  # 支持 pcd/ply/txt/heightmap/las/laz
+        self.train_external_source_profile = str(rospy.get_param(
+            '~train_external_source_profile', 'als')).strip().lower()
+        self.val_external_source_profile = str(rospy.get_param(
+            '~val_external_source_profile', 'als')).strip().lower()
+        for profile_name, profile in (
+                ('train_external_source_profile',
+                 self.train_external_source_profile),
+                ('val_external_source_profile',
+                 self.val_external_source_profile)):
+            if profile not in ('als', 'uls'):
+                raise ValueError(
+                    f"{profile_name} must be 'als' or 'uls', got {profile!r}")
+        self.external_domain = str(rospy.get_param(
+            '~external_domain', '')).strip()
+        self.train_external_source_url = str(rospy.get_param(
+            '~train_external_source_url', '')).strip()
+        self.val_external_source_url = str(rospy.get_param(
+            '~val_external_source_url', '')).strip()
+        self.train_external_license = str(rospy.get_param(
+            '~train_external_license', '')).strip()
+        self.val_external_license = str(rospy.get_param(
+            '~val_external_license', '')).strip()
+        self.train_external_crs = str(rospy.get_param(
+            '~train_external_crs', '')).strip()
+        self.val_external_crs = str(rospy.get_param(
+            '~val_external_crs', '')).strip()
+        self.train_external_site_id = str(rospy.get_param(
+            '~train_external_site_id', '')).strip()
+        self.val_external_site_id = str(rospy.get_param(
+            '~val_external_site_id', '')).strip()
+        configured_grades = rospy.get_param(
+            '~external_accepted_grades', 'easy,medium,hard')
+        if isinstance(configured_grades, str):
+            configured_grades = configured_grades.replace(';', ',').split(',')
+        self.external_accepted_grades = tuple(
+            str(grade).strip().lower()
+            for grade in configured_grades
+            if str(grade).strip())
+        if not self.external_accepted_grades:
+            raise ValueError("external_accepted_grades must not be empty")
+        # Online LAZ/ LAS fitting parameters.  A negative value means use the
+        # profile default; the resolved values are written into crop metadata.
+        self.external_fit_radius = float(rospy.get_param(
+            '~external_fit_radius', -1.0))
+        self.external_surface_cell_size = float(rospy.get_param(
+            '~external_surface_cell_size', -1.0))
+        self.external_direct_fit_min_points = int(rospy.get_param(
+            '~external_direct_fit_min_points', -1))
+        self.external_ground_band_below = float(rospy.get_param(
+            '~external_ground_band_below', 0.25))
+        self.external_ground_band_above = float(rospy.get_param(
+            '~external_ground_band_above', 0.35))
+        self.external_envelope_outlier = float(rospy.get_param(
+            '~external_envelope_outlier', 0.75))
+        self.external_planner_surface_resolution = float(rospy.get_param(
+            '~external_planner_surface_resolution', 0.05))
+        self.external_raw_below_surface_tolerance = float(rospy.get_param(
+            '~external_raw_below_surface_tolerance', 1.0))
+        self.external_raw_above_surface_tolerance = float(rospy.get_param(
+            '~external_raw_above_surface_tolerance', 50.0))
+        self.external_above_surface_height = float(rospy.get_param(
+            '~external_above_surface_height', 2.0))
+        self.external_above_surface_cell_size = float(rospy.get_param(
+            '~external_above_surface_cell_size', 1.0))
+        self.external_max_above_surface_coverage = float(rospy.get_param(
+            '~external_max_above_surface_coverage', 1.0))
+        self.external_min_above_surface_component_cells = int(
+            rospy.get_param('~external_min_above_surface_component_cells', 0))
+        self.external_tree_class_values = parse_las_class_values(
+            rospy.get_param('~external_tree_class_values', '1'),
+            'external_tree_class_values')
+        self.external_ground_class_values = parse_las_class_values(
+            rospy.get_param('~external_ground_class_values', '2'),
+            'external_ground_class_values')
+        self.external_min_tree_component_cells = int(
+            rospy.get_param('~external_min_tree_component_cells', 0))
         self.external_map_is_canonical = bool(
             rospy.get_param('~external_map_is_canonical', False))
         self.canonical_maps_per_environment = int(
@@ -1556,6 +1667,8 @@ class TerrainDatasetGenerator:
         self.current_crop_info = None
         self.current_source_transform = None
         self.current_canonical_grid = None
+        self.external_source_metadata = {}
+        self.external_source_classifications = {}
         # 每个worker对每个源地图只读取并规范化一次。后续环境以及地图重生成
         # 都只执行随机裁剪，避免反复加载点云。
         self.cached_external_source_maps = {}
@@ -1570,6 +1683,22 @@ class TerrainDatasetGenerator:
             raise ValueError("crop_padding must be non-negative")
         if self.external_map_min_physical_size < 0.0:
             raise ValueError("external_map_min_physical_size must be non-negative")
+        if self.external_above_surface_height < 0.0:
+            raise ValueError(
+                "external_above_surface_height must be non-negative")
+        if self.external_above_surface_cell_size <= 0.0:
+            raise ValueError(
+                "external_above_surface_cell_size must be positive")
+        if not 0.0 <= self.external_max_above_surface_coverage <= 1.0:
+            raise ValueError(
+                "external_max_above_surface_coverage must be in [0, 1]")
+        if self.external_min_above_surface_component_cells < 0:
+            raise ValueError(
+                "external_min_above_surface_component_cells must be "
+                "non-negative")
+        if self.external_min_tree_component_cells < 0:
+            raise ValueError(
+                "external_min_tree_component_cells must be non-negative")
         if not 0.0 <= self.crop_min_coverage <= 1.0:
             raise ValueError("crop_min_coverage must be in [0, 1]")
         if self.crop_rotation_max_deg < self.crop_rotation_min_deg:
@@ -1667,7 +1796,7 @@ class TerrainDatasetGenerator:
         # 状态变量
         self.current_env_id = self.start_env_id
         self.current_path_id = 0
-        self.current_phase = 'train'  # 'train' or 'val'
+        self.current_phase = self.start_phase  # 'train' or 'val'
         self.paths_generated_for_current_env = 0
         self.waiting_for_result = False
         self.current_trajectory = None
@@ -1687,8 +1816,11 @@ class TerrainDatasetGenerator:
         self.current_yaw_bins = None
         self.current_trajectory_stability_esdf = None
         self.current_stable_pose_candidates = None
+        self.current_endpoint_obstacle_mask = None
+        self.current_endpoint_obstacle_stats = None
         self.max_pose_distance = None
         self.current_pose_sampling_profile = None
+        self.current_path_profile_retry_round = 0
 
         # 一个路径只有一个重试管理者；定时器也只能有一个有效实例。
         self.planning_attempt_id = 0
@@ -1703,6 +1835,7 @@ class TerrainDatasetGenerator:
             'empty_trajectory': 0,
             'watchdog_timeout': 0,
             'environment_regenerated': 0,
+            'canonical_path_resampled': 0,
             'canonical_map_rejected': 0,
             'canonical_map_replaced': 0,
         }
@@ -2036,7 +2169,10 @@ class TerrainDatasetGenerator:
             self.scale_external_map_z)
         return pcd, transform_info
 
-    def sample_rotated_external_crop(self, source_pcd):
+    def sample_rotated_external_crop(self, source_pcd, max_attempts=None,
+                                     coverage_resolution=None,
+                                     source_classification=None,
+                                     return_classification=False):
         """
         从外部点云随机选取一个可旋转的正方形区域，并转换到局部地图坐标系。
 
@@ -2047,6 +2183,18 @@ class TerrainDatasetGenerator:
         all_source_points = np.asarray(source_pcd.points, dtype=np.float64)
         finite_mask = np.isfinite(all_source_points).all(axis=1)
         all_points_are_finite = bool(np.all(finite_mask))
+        if source_classification is not None:
+            all_source_classification = np.asarray(source_classification)
+            if (all_source_classification.ndim != 1 or
+                    len(all_source_classification) != len(all_source_points)):
+                raise ValueError(
+                    "source_classification must align with source point cloud")
+            source_classification = (
+                all_source_classification if all_points_are_finite
+                else all_source_classification[finite_mask])
+        elif return_classification:
+            raise ValueError(
+                "return_classification requires source_classification")
         # 常见PCD全部为有限值，此时保留Open3D的零拷贝视图；原先每次
         # 裁剪都会复制约500万点，既耗时又放大多worker的内存峰值。
         if all_points_are_finite:
@@ -2067,7 +2215,17 @@ class TerrainDatasetGenerator:
         crop_half_size = self.target_map_size / 2.0
         selection_half_size = crop_half_size + self.crop_padding
 
-        for attempt in range(1, self.crop_max_attempts + 1):
+        attempt_limit = (self.crop_max_attempts if max_attempts is None
+                         else int(max_attempts))
+        if attempt_limit <= 0:
+            raise ValueError("max_attempts must be positive")
+        support_resolution = (
+            self.coarse_resolution if coverage_resolution is None
+            else float(coverage_resolution))
+        if support_resolution <= 0.0:
+            raise ValueError("coverage_resolution must be positive")
+
+        for attempt in range(1, attempt_limit + 1):
             crop_yaw_deg = float(self.crop_rng.uniform(
                 self.crop_rotation_min_deg, self.crop_rotation_max_deg))
             crop_yaw = math.radians(crop_yaw_deg)
@@ -2100,13 +2258,13 @@ class TerrainDatasetGenerator:
             # 用C++聚合所采用的粗栅格分辨率检查空间覆盖率。仅检查点数
             # 会让扫描线状的稀疏裁剪通过，随后在100x100地图中产生大量NaN。
             coarse_grid_size = int(math.ceil(
-                self.target_map_size / self.coarse_resolution))
+                self.target_map_size / support_resolution))
             exact_x = local_x[exact_mask]
             exact_y = local_y[exact_mask]
             coarse_ix = np.floor(
-                (exact_x + crop_half_size) / self.coarse_resolution).astype(int)
+                (exact_x + crop_half_size) / support_resolution).astype(int)
             coarse_iy = np.floor(
-                (exact_y + crop_half_size) / self.coarse_resolution).astype(int)
+                (exact_y + crop_half_size) / support_resolution).astype(int)
             valid_indices = (
                 (coarse_ix >= 0) & (coarse_ix < coarse_grid_size) &
                 (coarse_iy >= 0) & (coarse_iy < coarse_grid_size))
@@ -2179,6 +2337,7 @@ class TerrainDatasetGenerator:
                 'points_in_target': exact_point_count,
                 'points_with_padding': int(len(cropped_points)),
                 'coarse_coverage': float(coarse_coverage),
+                'coarse_coverage_resolution': float(support_resolution),
                 'sampling_attempt': attempt,
                 'source_transform': dict(self.current_source_transform),
                 'source_bounds': (
@@ -2190,15 +2349,392 @@ class TerrainDatasetGenerator:
                 "points=%d (+padding: %d), coarse coverage=%.1f%%, attempt=%d",
                 center[0], center[1], crop_yaw_deg, exact_point_count,
                 len(cropped_points), coarse_coverage * 100.0, attempt)
+            if return_classification:
+                return (target_pcd, cropped_pcd, crop_info,
+                        source_classification[exact_mask].copy(),
+                        source_classification[padded_mask].copy())
             return target_pcd, cropped_pcd, crop_info
 
         raise RuntimeError(
             "Unable to sample a valid rotated external-map crop after "
-            f"{self.crop_max_attempts} attempts. Source bounds are "
+            f"{attempt_limit} attempts. Source bounds are "
             f"x[{source_min[0]:.3f}, {source_max[0]:.3f}], "
             f"y[{source_min[1]:.3f}, {source_max[1]:.3f}]. "
             "Check external_map_physical_size, or reduce crop_padding/"
             "crop_min_points/crop_min_coverage.")
+
+    def external_source_profile_for_current_phase(self):
+        """Return the quality profile used by the active dataset split."""
+        profile = (self.train_external_source_profile
+                   if self.current_phase == 'train'
+                   else self.val_external_source_profile)
+        if profile not in ('als', 'uls'):
+            raise ValueError(
+                "external source profile must be 'als' or 'uls', got "
+                f"{profile!r}")
+        return profile
+
+    def external_source_description_for_current_phase(self):
+        """Return split-specific provenance fields for saved map metadata."""
+        if self.current_phase == 'train':
+            return {
+                'source_url': self.train_external_source_url,
+                'license': self.train_external_license,
+                'source_crs': self.train_external_crs,
+                'site_id': self.train_external_site_id,
+            }
+        return {
+            'source_url': self.val_external_source_url,
+            'license': self.val_external_license,
+            'source_crs': self.val_external_crs,
+            'site_id': self.val_external_site_id,
+        }
+
+    def online_surface_fit_args(self):
+        """Resolve profile defaults and explicit online fitting parameters."""
+        profile = self.external_source_profile_for_current_phase()
+        defaults = {
+            'als': {
+                'fit_radius': 0.90,
+                'surface_cell_size': 1.00,
+                'direct_fit_min_points': 5,
+                'coverage_resolution': 1.00,
+            },
+            'uls': {
+                'fit_radius': 0.35,
+                'surface_cell_size': 0.50,
+                'direct_fit_min_points': 8,
+                'coverage_resolution': 0.20,
+            },
+        }[profile]
+
+        fit_radius = (self.external_fit_radius
+                      if self.external_fit_radius > 0.0
+                      else defaults['fit_radius'])
+        surface_cell_size = (
+            self.external_surface_cell_size
+            if self.external_surface_cell_size > 0.0
+            else defaults['surface_cell_size'])
+        direct_fit_min_points = (
+            self.external_direct_fit_min_points
+            if self.external_direct_fit_min_points > 0
+            else defaults['direct_fit_min_points'])
+        if self.external_ground_band_below < 0.0:
+            raise ValueError("external_ground_band_below must be non-negative")
+        if self.external_ground_band_above < 0.0:
+            raise ValueError("external_ground_band_above must be non-negative")
+        if self.external_envelope_outlier <= 0.0:
+            raise ValueError("external_envelope_outlier must be positive")
+        if self.external_planner_surface_resolution <= 0.0:
+            raise ValueError(
+                "external_planner_surface_resolution must be positive")
+        if self.external_raw_below_surface_tolerance < 0.0:
+            raise ValueError(
+                "external_raw_below_surface_tolerance must be non-negative")
+        if self.external_raw_above_surface_tolerance < 0.0:
+            raise ValueError(
+                "external_raw_above_surface_tolerance must be non-negative")
+
+        return SimpleNamespace(
+            size=self.target_map_size,
+            resolution=self.target_resolution,
+            fit_radius=fit_radius,
+            surface_cell_size=surface_cell_size,
+            ground_band_below=self.external_ground_band_below,
+            ground_band_above=self.external_ground_band_above,
+            envelope_outlier=self.external_envelope_outlier,
+            direct_fit_min_points=direct_fit_min_points,
+            coverage_resolution=defaults['coverage_resolution'],
+            planner_surface_resolution=(
+                self.external_planner_surface_resolution),
+            raw_below_surface_tolerance=(
+                self.external_raw_below_surface_tolerance),
+            raw_above_surface_tolerance=(
+                self.external_raw_above_surface_tolerance),
+            above_surface_height=self.external_above_surface_height,
+            above_surface_cell_size=self.external_above_surface_cell_size,
+            max_above_surface_coverage=(
+                self.external_max_above_surface_coverage),
+            min_above_surface_component_cells=(
+                self.external_min_above_surface_component_cells),
+            tree_class_values=self.external_tree_class_values,
+            ground_class_values=self.external_ground_class_values,
+            min_tree_component_cells=self.external_min_tree_component_cells,
+            source_profile=profile,
+        )
+
+    def evaluate_online_surface(self, surface, exact_point_count,
+                                crop_info, fit_args):
+        """Run the existing terrain quality policy on an in-memory crop.
+
+        The quality module is intentionally shared with the offline mother-map
+        sampler.  Its public interface is NPZ-based, so this creates one
+        short-lived scratch pair per candidate; rejected candidates never
+        enter the dataset directory or a sampled-scene pool.
+        """
+        map_size_area = self.target_map_size ** 2
+        metadata = {
+            'source_surface_density_points_per_m2': float(
+                exact_point_count / map_size_area),
+            'planner_point_density_points_per_m2': float(
+                len(surface['planner_xyz']) / map_size_area),
+            'source_support_coverage': float(
+                crop_info['coarse_coverage']),
+            'source_support_resolution_m': float(
+                crop_info.get('coarse_coverage_resolution',
+                              fit_args.coverage_resolution)),
+            'processing': {
+                'source_profile': fit_args.source_profile,
+                'source_support_resolution_m': float(
+                    fit_args.coverage_resolution),
+                'fit_radius_m': float(fit_args.fit_radius),
+                'surface_cell_size_m': float(fit_args.surface_cell_size),
+                'ground_band_below_m': float(fit_args.ground_band_below),
+                'ground_band_above_m': float(fit_args.ground_band_above),
+                'envelope_outlier_m': float(fit_args.envelope_outlier),
+                'direct_fit_minimum_points': int(
+                    fit_args.direct_fit_min_points),
+                'planner_surface_resolution_m': float(
+                    fit_args.planner_surface_resolution),
+                'raw_below_surface_tolerance_m': float(
+                    fit_args.raw_below_surface_tolerance),
+                'raw_above_surface_tolerance_m': float(
+                    fit_args.raw_above_surface_tolerance),
+                'above_surface_height_m': float(
+                    fit_args.above_surface_height),
+                'above_surface_cell_size_m': float(
+                    fit_args.above_surface_cell_size),
+                'max_above_surface_coverage': float(
+                    fit_args.max_above_surface_coverage),
+                'min_above_surface_component_cells': int(
+                    fit_args.min_above_surface_component_cells),
+                'tree_class_values': list(fit_args.tree_class_values),
+                'ground_class_values': list(fit_args.ground_class_values),
+                'min_tree_component_cells': int(
+                    fit_args.min_tree_component_cells),
+            },
+        }
+        normals = np.asarray(surface['normals'], dtype=np.float32)
+        with tempfile.TemporaryDirectory(prefix='terrain-quality-') as temp_dir:
+            npz_path = os.path.join(temp_dir, 'candidate.npz')
+            np.savez_compressed(
+                npz_path,
+                elevation=np.asarray(surface['elevation'], dtype=np.float32),
+                normal_x=normals[:, :, 0],
+                normal_y=normals[:, :, 1],
+                normal_z=normals[:, :, 2],
+                valid_mask=np.asarray(surface['valid'], dtype=bool),
+                observed_mask=np.asarray(surface['observed'], dtype=bool),
+                resolution=np.float32(self.target_resolution),
+                size=np.float32(self.target_map_size),
+            )
+            with open(os.path.splitext(npz_path)[0] + '.json', 'w',
+                      encoding='utf-8') as stream:
+                json.dump(metadata, stream, ensure_ascii=False)
+            quality = evaluate_terrain_map(npz_path)
+        quality.pop('path', None)
+        return quality, metadata
+
+    def prepare_online_laz_crop(self, source_pcd, source_classification=None):
+        """Sample, fit, grade, and return one accepted LAZ crop.
+
+        A crop that fails fitting or the quality gate is discarded immediately;
+        the next attempt starts from the same cached mother map.  Nothing is
+        written until this method returns an accepted fitted surface.
+        """
+        fit_args = self.online_surface_fit_args()
+        last_reason = 'no candidate was sampled'
+        for quality_attempt in range(1, self.crop_max_attempts + 1):
+            try:
+                sampled_crop = self.sample_rotated_external_crop(
+                    source_pcd,
+                    max_attempts=1,
+                    coverage_resolution=fit_args.coverage_resolution,
+                    source_classification=source_classification,
+                    return_classification=source_classification is not None)
+                if source_classification is None:
+                    target_pcd, padded_pcd, crop_info = sampled_crop
+                    target_classification = None
+                else:
+                    (target_pcd, padded_pcd, crop_info,
+                     target_classification, _) = sampled_crop
+            except RuntimeError as exc:
+                last_reason = str(exc)
+                continue
+
+            exact = np.asarray(target_pcd.points, dtype=np.float64)
+            padded = np.asarray(padded_pcd.points, dtype=np.float64)
+            try:
+                surface = build_surface(exact, padded, fit_args)
+                quality, quality_metadata = self.evaluate_online_surface(
+                    surface, len(exact), crop_info, fit_args)
+                above_surface = measure_above_surface_coverage(
+                    surface,
+                    self.target_map_size,
+                    self.target_resolution,
+                    fit_args.above_surface_height,
+                    fit_args.above_surface_cell_size)
+                classified_above_surface = None
+                if target_classification is not None:
+                    classified_above_surface = (
+                        measure_classified_above_surface_coverage(
+                            surface,
+                            exact,
+                            target_classification,
+                            self.target_map_size,
+                            self.target_resolution,
+                            fit_args.above_surface_height,
+                            fit_args.above_surface_cell_size,
+                            fit_args.tree_class_values,
+                            fit_args.ground_class_values))
+            except Exception as exc:
+                last_reason = f'online surface fitting failed: {exc}'
+                rospy.logdebug(
+                    "Rejecting LAZ crop %d/%d for fitting failure: %s",
+                    quality_attempt, self.crop_max_attempts, exc)
+                continue
+
+            crop_info['online_surface_fitting'] = True
+            crop_info['quality_attempt'] = quality_attempt
+            crop_info['quality'] = quality
+            crop_info['quality_metadata'] = quality_metadata
+            crop_info['above_surface'] = above_surface
+            if classified_above_surface is not None:
+                crop_info['classified_above_surface'] = (
+                    classified_above_surface)
+            crop_info['fit_parameters'] = quality_metadata['processing']
+            crop_info['source_raw_points_in_patch'] = int(len(exact))
+            crop_info['planner_point_count'] = int(len(surface['planner_xyz']))
+            crop_info['ground_candidate_count'] = int(
+                surface['ground_candidate_count'])
+            crop_info['observed_fraction'] = float(
+                np.mean(surface['observed']))
+            crop_info['valid_fraction'] = float(np.mean(surface['valid']))
+            crop_info['vertical_origin_m'] = float(surface['vertical_origin'])
+            source_metadata = self.external_source_metadata.get(
+                self.external_map_path, {})
+
+            grade = str(quality.get('grade') or '').lower()
+            above_surface_coverage = float(
+                above_surface['above_surface_coverage_fraction'])
+            density_accepted = (
+                above_surface_coverage
+                <= fit_args.max_above_surface_coverage)
+            component_accepted = (
+                above_surface['above_surface_largest_component_cells']
+                >= fit_args.min_above_surface_component_cells)
+            tree_component_accepted = (
+                classified_above_surface is not None
+                and classified_above_surface[
+                    'tree_candidate_largest_component_cells']
+                >= fit_args.min_tree_component_cells)
+            if fit_args.min_tree_component_cells == 0:
+                tree_component_accepted = True
+            accepted = (
+                quality.get('quality') == 'pass'
+                and grade in self.external_accepted_grades
+                and density_accepted
+                and component_accepted
+                and tree_component_accepted)
+            if not accepted:
+                reasons = quality.get('reasons') or []
+                if not density_accepted:
+                    reasons = list(reasons) + [
+                        'above_surface_coverage %.3f > max %.3f' % (
+                            above_surface_coverage,
+                            fit_args.max_above_surface_coverage)]
+                if not component_accepted:
+                    reasons = list(reasons) + [
+                        'above_surface_largest_component %d < min %d' % (
+                            above_surface[
+                                'above_surface_largest_component_cells'],
+                            fit_args.min_above_surface_component_cells)]
+                if not tree_component_accepted:
+                    tree_largest = (0 if classified_above_surface is None else
+                                    classified_above_surface[
+                                        'tree_candidate_largest_component_cells'])
+                    reasons = list(reasons) + [
+                        'tree_candidate_largest_component %d < min %d' % (
+                            tree_largest, fit_args.min_tree_component_cells)]
+                last_reason = (
+                    ','.join(reasons) if reasons
+                    else f"grade {grade or 'none'} not accepted")
+                rospy.loginfo(
+                    "Rejected online LAZ crop %d/%d: quality=%s grade=%s "
+                    "score=%s reasons=%s",
+                    quality_attempt, self.crop_max_attempts,
+                    quality.get('quality'), quality.get('grade'),
+                    quality.get('geometry_score'), last_reason)
+                continue
+
+            source_description = (
+                self.external_source_description_for_current_phase())
+            mother_map_sample = dict(source_metadata)
+            mother_map_sample.update(source_description)
+            mother_map_sample.update({
+                'source_file': os.path.abspath(self.external_map_path),
+                'domain': self.external_domain,
+                'patch_size_m': float(self.target_map_size),
+                'resolution_m': float(self.target_resolution),
+                'grid_shape': list(surface['elevation'].shape),
+                'source_surface': 'all_finite_XYZ_no_LAS_class_filter',
+                'source_raw_points_in_patch': int(len(exact)),
+                'raw_returns_retained_in_planner_pcd': int(
+                    len(surface['raw_xyz'])),
+                'planner_point_count': int(len(surface['planner_xyz'])),
+                'source_support_coverage': float(
+                    crop_info['coarse_coverage']),
+                'source_support_resolution_m': float(
+                    crop_info['coarse_coverage_resolution']),
+                'crop_center_in_source_frame': list(
+                    crop_info['center_in_source_frame']),
+                'crop_yaw_deg': float(crop_info['yaw_deg']),
+                'quality': dict(quality),
+                'above_surface': dict(above_surface),
+                'classified_above_surface': (
+                    dict(classified_above_surface)
+                    if classified_above_surface is not None else None),
+                'processing': dict(quality_metadata['processing']),
+            })
+            crop_info['mother_map_sample'] = mother_map_sample
+            if source_metadata:
+                crop_info['mother_map_source'] = dict(source_metadata)
+
+            grid_map_data = {
+                'elevation': np.asarray(surface['elevation'], dtype=np.float32),
+                'normal_x': np.asarray(
+                    surface['normals'][:, :, 0], dtype=np.float32),
+                'normal_y': np.asarray(
+                    surface['normals'][:, :, 1], dtype=np.float32),
+                'normal_z': np.asarray(
+                    surface['normals'][:, :, 2], dtype=np.float32),
+                'valid_mask': np.asarray(surface['valid'], dtype=bool),
+                'observed_mask': np.asarray(surface['observed'], dtype=bool),
+                'bounds': (
+                    -self.target_map_size / 2.0,
+                    self.target_map_size / 2.0,
+                    -self.target_map_size / 2.0,
+                    self.target_map_size / 2.0),
+                'resolution': self.target_resolution,
+            }
+            planner_pcd = o3d.geometry.PointCloud()
+            planner_pcd.points = o3d.utility.Vector3dVector(
+                np.asarray(surface['planner_xyz'], dtype=np.float64))
+            planner_pcd.normals = o3d.utility.Vector3dVector(
+                np.asarray(surface['planner_normals'], dtype=np.float64))
+            rospy.loginfo(
+                "Accepted online LAZ crop: grade=%s score=%.2f, "
+                "raw=%d planner=%d valid=%.1f%% observed=%.1f%%",
+                grade, float(quality.get('geometry_score', float('nan'))),
+                len(exact), len(surface['planner_xyz']),
+                100.0 * crop_info['valid_fraction'],
+                100.0 * crop_info['observed_fraction'])
+            return planner_pcd, planner_pcd, crop_info, grid_map_data
+
+        raise RuntimeError(
+            "Unable to obtain an accepted online LAZ crop after "
+            f"{self.crop_max_attempts} candidates; last rejection: "
+            f"{last_reason}")
 
     def validate_canonical_external_map(self, source_pcd):
         """Validate an already prepared metric map without augmenting it.
@@ -2246,10 +2782,13 @@ class TerrainDatasetGenerator:
 
         z_min = float(points[:, 2].min())
         z_max = float(points[:, 2].max())
-        if z_min < -0.009 or z_max > 5.0:
-            raise ValueError(
-                "Canonical external map violates UnevenMap z contract "
-                f"[-0.01, 5.0]: [{z_min:.3f}, {z_max:.3f}]")
+        # The canonical PCD now intentionally retains all raw returns in the
+        # crop, including canopy/rock returns above the historical 5 m fitted
+        # surface range. The 4-channel NPZ remains the bounded terrain grid;
+        # only the lower offset contract applies to the raw PCD here.
+        # No z-range gate is applied to the retained raw PCD. The 4-channel
+        # NPZ is the bounded terrain grid; raw returns may lie below or above
+        # its fitted surface and are kept for later runtime masking.
 
         source_transform = {
             'raw_bounds': (
@@ -2323,9 +2862,17 @@ class TerrainDatasetGenerator:
             raise ValueError(
                 f"Canonical valid_mask has shape {valid_mask.shape}, "
                 f"expected {expected_shape}")
-        if valid_mask.mean() < 0.97:
+        if 'observed_mask' in sidecar.files:
+            observed_mask = np.asarray(sidecar['observed_mask'], dtype=bool)
+        else:
+            observed_mask = valid_mask.copy()
+        if observed_mask.shape != expected_shape:
             raise ValueError(
-                f"Canonical valid fraction {valid_mask.mean():.3f} < 0.97")
+                f"Canonical observed_mask has shape {observed_mask.shape}, "
+                f"expected {expected_shape}")
+        if valid_mask.mean() < 1.0:
+            raise ValueError(
+                "Canonical completed surface still contains invalid cells")
         if not math.isclose(
                 float(sidecar['resolution']), self.target_resolution,
                 rel_tol=0.0, abs_tol=1e-6):
@@ -2336,11 +2883,14 @@ class TerrainDatasetGenerator:
             raise ValueError("Canonical NPZ size mismatch")
         half_size = 0.5 * self.target_map_size
         result['valid_mask'] = valid_mask
+        result['observed_mask'] = observed_mask
         result['bounds'] = (-half_size, half_size, -half_size, half_size)
         result['resolution'] = self.target_resolution
         rospy.loginfo(
-            "Loaded canonical grid sidecar %s: shape=%s, valid=%.2f%%",
-            sidecar_path, expected_shape, valid_mask.mean() * 100.0)
+            "Loaded canonical grid sidecar %s: shape=%s, valid=%.2f%%, "
+            "observed=%.2f%%",
+            sidecar_path, expected_shape, valid_mask.mean() * 100.0,
+            observed_mask.mean() * 100.0)
         return result
 
     @staticmethod
@@ -2377,6 +2927,7 @@ class TerrainDatasetGenerator:
         
         # 生成或加载地形
         if self.use_external_map:
+            online_grid_map_data = None
             selected_map_path = self.select_external_map_path()
             cache_entry = self.cached_external_source_maps.get(
                 selected_map_path)
@@ -2390,23 +2941,31 @@ class TerrainDatasetGenerator:
                         selected_map_path)
                     if source_metadata is not None:
                         canonical_info['mother_map_sample'] = source_metadata
+                        if isinstance(source_metadata.get('quality'), dict):
+                            canonical_info['quality'] = dict(
+                                source_metadata['quality'])
                     canonical_grid = self.load_canonical_grid(
                         selected_map_path)
                     cache_entry = (
                         source_pcd, source_transform, canonical_info,
-                        canonical_grid)
+                        canonical_grid,
+                        self.external_source_classifications.get(
+                            selected_map_path))
                 else:
                     source_pcd, source_transform = (
                         self.normalize_external_map_scale(source_pcd))
                     source_pcd = self.prepare_external_map_frame(source_pcd)
-                    cache_entry = (source_pcd, source_transform, None, None)
+                    cache_entry = (
+                        source_pcd, source_transform, None, None,
+                        self.external_source_classifications.get(
+                            selected_map_path))
                 self.cached_external_source_maps[selected_map_path] = cache_entry
             else:
                 rospy.loginfo(
                     "Reusing cached external source map: %s",
                     selected_map_path)
             (source_pcd, self.current_source_transform, canonical_info,
-             canonical_grid) = cache_entry
+             canonical_grid, source_classification) = cache_entry
             if self.external_map_is_canonical:
                 pcd = source_pcd
                 grid_input_pcd = source_pcd
@@ -2414,8 +2973,13 @@ class TerrainDatasetGenerator:
                 self.current_canonical_grid = canonical_grid
             else:
                 self.current_canonical_grid = None
-                pcd, grid_input_pcd, self.current_crop_info = (
-                    self.sample_rotated_external_crop(source_pcd))
+                if self.external_map_format.lower() in ('las', 'laz'):
+                    (pcd, grid_input_pcd, self.current_crop_info,
+                     online_grid_map_data) = self.prepare_online_laz_crop(
+                         source_pcd, source_classification)
+                else:
+                    pcd, grid_input_pcd, self.current_crop_info = (
+                        self.sample_rotated_external_crop(source_pcd))
 
             # 为外部地图创建基本的terrain_info
             points = np.asarray(pcd.points)
@@ -2448,6 +3012,11 @@ class TerrainDatasetGenerator:
                 # The NPZ sidecar is the already audited network/occupancy
                 # grid. Keep the dense PCD exclusively for UnevenMap fitting.
                 grid_map_data = dict(self.current_canonical_grid)
+            elif online_grid_map_data is not None:
+                # LAZ/ LAS crops are fitted and graded before they reach the
+                # planner.  Keep the fitted grid instead of re-rasterizing
+                # the raw mother-map returns with the generic converter.
+                grid_map_data = dict(online_grid_map_data)
             else:
                 # 点云已经被旋转、裁剪并移到局部坐标系。只对20m目标区域
                 # 栅格化，避免先处理整张大地图再做固定中心裁剪。
@@ -2585,6 +3154,7 @@ class TerrainDatasetGenerator:
             self.current_yaw_scores = None
             self.current_yaw_bins = None
             self.current_trajectory_stability_esdf = None
+        self.prepare_endpoint_obstacle_mask(pcd, grid_map_data)
         self.prepare_stable_pose_candidates()
 
         # Ensure grid_map_tensor is defined: build from elevation + normals, with fallbacks
@@ -2651,7 +3221,25 @@ class TerrainDatasetGenerator:
             target_bounds = (
                 -self.target_map_size / 2.0, self.target_map_size / 2.0,
                 -self.target_map_size / 2.0, self.target_map_size / 2.0)
-            
+            valid_mask = np.asarray(
+                grid_map_data.get(
+                    'valid_mask',
+                    np.ones(grid_map_tensor.shape[:2], dtype=bool)),
+                dtype=bool)
+            observed_mask = np.asarray(
+                grid_map_data.get('observed_mask', valid_mask), dtype=bool)
+            if (valid_mask.shape != grid_map_tensor.shape[:2] or
+                    observed_mask.shape != grid_map_tensor.shape[:2]):
+                raise RuntimeError(
+                    "External map masks must match the saved grid tensor: "
+                    f"valid={valid_mask.shape}, observed={observed_mask.shape}, "
+                    f"tensor={grid_map_tensor.shape[:2]}")
+            sample_metadata = (
+                (self.current_crop_info or {}).get('mother_map_sample') or {})
+            quality = (self.current_crop_info or {}).get('quality')
+            if quality is None:
+                quality = sample_metadata.get('quality')
+
             map_data = {
                 'tensor': grid_map_tensor,
                 'bounds': target_bounds,
@@ -2661,14 +3249,22 @@ class TerrainDatasetGenerator:
                 'shape': grid_map_tensor.shape,
                 'source': 'external_map',
                 'dataset_phase': self.current_phase,
-                'original_map_path': self.external_map_path,
+                'original_map_path': (
+                    None if self.external_map_is_canonical
+                    else self.external_map_path),
                 'original_map_index': self.current_external_map_index,
+                'source_map': {
+                    'scene': os.path.splitext(
+                        os.path.basename(self.external_map_path))[0],
+                    'split': self.current_phase,
+                },
                 'crop': dict(self.current_crop_info),
-                'valid_mask': np.asarray(
-                    grid_map_data.get(
-                        'valid_mask',
-                        np.ones(grid_map_tensor.shape[:2], dtype=bool)),
-                    dtype=bool),
+                'valid_mask': valid_mask,
+                'observed_mask': observed_mask,
+                'quality': dict(quality) if isinstance(quality, dict) else quality,
+                'endpoint_obstacle_filter': (
+                    dict(self.current_endpoint_obstacle_stats)
+                    if self.current_endpoint_obstacle_stats is not None else None),
                 'target_grid_size': f"{grid_map_tensor.shape[0]}x{grid_map_tensor.shape[1]}"
             }
             rospy.loginfo(
@@ -2798,7 +3394,8 @@ class TerrainDatasetGenerator:
         # 重置路径计数
         self.current_path_id = 0
         self.paths_generated_for_current_env = 0
-        
+        self.current_path_profile_retry_round = 0
+
         return env_dir
     
     def save_terrain_visualizations(
@@ -2996,6 +3593,8 @@ class TerrainDatasetGenerator:
         只保留XY可通行区域中最大的连通分量，并且每个候选姿态对应的
         yaw bin 都必须稳定。这个检查与最终轨迹验证使用同一份 yaw_scores，
         因此不会放宽数据要求，只会在调用昂贵规划器前拒绝明显无效的端点。
+        对外部点云，再排除明显高于拟合地面的原始回波所在单元，避免把
+        树冠/树顶当成可站立的地面端点。
         """
         self.current_stable_pose_candidates = None
         if (not self.prefilter_stable_poses or
@@ -3020,30 +3619,131 @@ class TerrainDatasetGenerator:
         inside_y = ((y_centers >= self.map_y_min) &
                     (y_centers <= self.map_y_max))
         allowed_xy = inside_y[:, None] & inside_x[None, :]
-        traversable = np.any(stable, axis=2) & allowed_xy
 
-        labels, component_count = connected_component_label(
-            traversable, structure=np.ones((3, 3), dtype=np.uint8))
-        if component_count == 0:
-            rospy.logwarn("Stable-pose prefilter found no traversable component")
-            return
+        def candidates_in_largest_component(stable_mask):
+            traversable = np.any(stable_mask, axis=2) & allowed_xy
+            labels, component_count = connected_component_label(
+                traversable, structure=np.ones((3, 3), dtype=np.uint8))
+            if component_count == 0:
+                return None, 0, 0
+            component_sizes = np.bincount(labels.ravel())
+            component_sizes[0] = 0
+            largest_label = int(np.argmax(component_sizes))
+            largest_xy = labels == largest_label
+            candidates = np.argwhere(
+                stable_mask & largest_xy[:, :, None])
+            return candidates, int(component_sizes[largest_label]), int(
+                np.count_nonzero(traversable))
 
-        component_sizes = np.bincount(labels.ravel())
-        component_sizes[0] = 0
-        largest_label = int(np.argmax(component_sizes))
-        largest_xy = labels == largest_label
-        candidates = np.argwhere(stable & largest_xy[:, :, None])
-        if len(candidates) < 2:
-            rospy.logwarn("Stable-pose prefilter found fewer than two candidates")
+        filtered_stable = stable
+        obstacle_mask = self.current_endpoint_obstacle_mask
+        obstacle_mask_applied = (
+            obstacle_mask is not None and
+            obstacle_mask.shape == stable.shape[:2])
+        if obstacle_mask_applied:
+            filtered_stable = stable & ~obstacle_mask[:, :, None]
+
+        candidates, largest_size, traversable_count = (
+            candidates_in_largest_component(filtered_stable))
+        if candidates is None or len(candidates) < 2:
+            if obstacle_mask_applied:
+                # The obstacle mask is an endpoint prefilter, not a map
+                # acceptance gate. Keep the manually accepted map usable if a
+                # future threshold/configuration removes all stable cells.
+                rospy.logwarn(
+                    "Endpoint obstacle mask left fewer than two stable "
+                    "candidates; using the unmasked stable surface for this "
+                    "map")
+                obstacle_mask_applied = False
+                candidates, largest_size, traversable_count = (
+                    candidates_in_largest_component(stable))
+        if candidates is None or len(candidates) < 2:
+            rospy.logwarn(
+                "Stable-pose prefilter found fewer than two candidates")
             return
 
         self.current_stable_pose_candidates = candidates.astype(
             np.int32, copy=False)
         rospy.loginfo(
             "Stable-pose prefilter prepared %d poses in largest component "
-            "(%d/%d traversable cells)",
-            len(candidates), int(component_sizes[largest_label]),
-            int(np.count_nonzero(traversable)))
+            "(%d/%d traversable cells, obstacle mask=%s)",
+            len(candidates), largest_size, traversable_count,
+            "on" if obstacle_mask_applied else "off")
+
+    def prepare_endpoint_obstacle_mask(self, pointcloud, grid_map_data):
+        """Mark cells containing returns clearly above the fitted surface.
+
+        The planner PCD contains both the dense fitted ground surface and the
+        retained raw returns. Comparing every return with the saved fitted
+        elevation makes canopy/top returns visible without relying on LAS
+        classifications, while low returns/noise do not enter this mask.
+        """
+        self.current_endpoint_obstacle_mask = None
+        self.current_endpoint_obstacle_stats = None
+        if not self.use_external_map or pointcloud is None:
+            return
+
+        elevation = np.asarray(
+            grid_map_data.get('elevation'), dtype=np.float64)
+        bounds = grid_map_data.get('bounds')
+        resolution = float(grid_map_data.get('resolution', 0.0))
+        points = np.asarray(pointcloud.points, dtype=np.float64)
+        if (elevation.ndim != 2 or len(points) == 0 or
+                bounds is None or len(bounds) != 4 or resolution <= 0.0):
+            rospy.logwarn(
+                "Cannot prepare endpoint obstacle mask: incomplete external "
+                "point cloud/grid data")
+            return
+
+        min_x, _, min_y, _ = (float(value) for value in bounds)
+        columns = (points[:, 0] - min_x) / resolution - 0.5
+        rows = (points[:, 1] - min_y) / resolution - 0.5
+        inside = (
+            np.isfinite(points).all(axis=1) &
+            (columns >= 0.0) &
+            (columns <= elevation.shape[1] - 1) &
+            (rows >= 0.0) &
+            (rows <= elevation.shape[0] - 1))
+        fitted_z = np.full(len(points), np.nan, dtype=np.float64)
+        if np.any(inside):
+            fitted_z[inside] = map_coordinates(
+                elevation,
+                np.vstack((rows[inside], columns[inside])),
+                order=1,
+                mode='nearest')
+        residual = points[:, 2] - fitted_z
+        above = np.isfinite(residual) & (
+            residual > self.external_above_surface_height)
+
+        obstacle_mask = np.zeros(elevation.shape, dtype=bool)
+        if np.any(above):
+            ix = np.floor((points[above, 0] - min_x) / resolution).astype(
+                np.int64)
+            iy = np.floor((points[above, 1] - min_y) / resolution).astype(
+                np.int64)
+            in_cells = (
+                (ix >= 0) & (ix < obstacle_mask.shape[1]) &
+                (iy >= 0) & (iy < obstacle_mask.shape[0]))
+            obstacle_mask[iy[in_cells], ix[in_cells]] = True
+
+        self.current_endpoint_obstacle_mask = obstacle_mask
+        self.current_endpoint_obstacle_stats = {
+            'height_threshold_m': float(self.external_above_surface_height),
+            'point_count': int(len(points)),
+            'above_surface_point_count': int(np.count_nonzero(above)),
+            'occupied_cell_count': int(np.count_nonzero(obstacle_mask)),
+            'total_cell_count': int(obstacle_mask.size),
+            'occupied_cell_fraction': float(obstacle_mask.mean()),
+        }
+        rospy.loginfo(
+            "Endpoint obstacle mask: returns>%0.2fm=%d, cells=%d/%d "
+            "(%0.1f%%)",
+            self.external_above_surface_height,
+            self.current_endpoint_obstacle_stats['above_surface_point_count'],
+            self.current_endpoint_obstacle_stats['occupied_cell_count'],
+            self.current_endpoint_obstacle_stats['total_cell_count'],
+            100.0 * self.current_endpoint_obstacle_stats[
+                'occupied_cell_fraction'])
 
     def pose_from_stable_candidate(self, candidate):
         """把 (iy, ix, yaw_bin) 候选项转换为栅格内部的连续位姿。"""
@@ -3080,10 +3780,12 @@ class TerrainDatasetGenerator:
     
     def pose_sampling_profile_for_current_path(self):
         """
-        为当前路径确定固定的距离和朝向难度档位。
+        为当前路径确定距离和朝向难度档位。
 
-        档位由环境、阶段和path id确定，因此规划失败后的重试不会从长/难
-        轨迹退化成短/简单轨迹。两个互质排列让距离与难度档位彼此解耦。
+        初始档位由环境、阶段和path id确定，因此普通重试不会改变数据配额。
+        canonical 地图上的某条路径连续失败后，调用方只为这条路径增加
+        retry round，逐级选择更容易的档位；成功后下一条路径恢复原始配额。
+        两个互质排列让距离与难度档位彼此解耦。
         """
         phase_offset = 17 if self.current_phase == 'val' else 0
         distance_slot = (
@@ -3094,22 +3796,38 @@ class TerrainDatasetGenerator:
             self.current_env_id * 29 + phase_offset) % 100 / 100.0
 
         if distance_slot < self.long_distance_fraction:
-            distance_class = 'long'
+            base_distance_class = 'long'
         elif distance_slot < (
                 self.long_distance_fraction +
                 self.medium_distance_fraction):
-            distance_class = 'medium'
+            base_distance_class = 'medium'
         else:
-            distance_class = 'short'
+            base_distance_class = 'short'
 
         if complexity_slot < self.high_complexity_fraction:
-            complexity_class = 'high'
+            base_complexity_class = 'high'
         elif complexity_slot < (
                 self.high_complexity_fraction +
                 self.moderate_complexity_fraction):
-            complexity_class = 'moderate'
+            base_complexity_class = 'moderate'
         else:
-            complexity_class = 'simple'
+            base_complexity_class = 'simple'
+
+        retry_round = max(0, int(self.current_path_profile_retry_round))
+        distance_fallbacks = {
+            'long': ('long', 'medium', 'short'),
+            'medium': ('medium', 'short'),
+            'short': ('short',),
+        }
+        complexity_fallbacks = {
+            'high': ('high', 'moderate', 'simple'),
+            'moderate': ('moderate', 'simple'),
+            'simple': ('simple',),
+        }
+        distance_class = distance_fallbacks[base_distance_class][min(
+            retry_round, len(distance_fallbacks[base_distance_class]) - 1)]
+        complexity_class = complexity_fallbacks[base_complexity_class][min(
+            retry_round, len(complexity_fallbacks[base_complexity_class]) - 1)]
 
         max_distance = float(self.max_pose_distance)
         distance_ratio_ranges = {
@@ -3132,6 +3850,10 @@ class TerrainDatasetGenerator:
         return {
             'distance_class': distance_class,
             'complexity_class': complexity_class,
+            'base_distance_class': base_distance_class,
+            'base_complexity_class': base_complexity_class,
+            'profile_retry_round': retry_round,
+            'profile_relaxed': bool(retry_round > 0),
             'target_distance_range': (distance_min, distance_max),
             'target_heading_mismatch_range_rad': (
                 mismatch_min, mismatch_max),
@@ -3314,60 +4036,29 @@ class TerrainDatasetGenerator:
             return False
 
         if self.external_map_is_canonical:
-            self.retry_statistics['canonical_map_rejected'] += 1
-            phase_paths = (self.train_external_map_paths
-                           if self.current_phase == 'train'
-                           else self.val_external_map_paths)
-            replacement_key = (self.current_phase, self.current_env_id)
-            next_round = self.canonical_replacement_round.get(
-                replacement_key, 0) + 1
-            local_environment = (
-                self.current_env_id - self.canonical_pool_start_env_id)
-            next_index = (
-                local_environment
-                + next_round * self.canonical_primary_scene_count)
-            rejection = {
-                'environment_id': self.current_env_id,
-                'phase': self.current_phase,
-                'path_id': self.current_path_id,
-                'failed_attempts': self.path_retry_count,
-                'rejected_map': self.external_map_path,
-                'replacement_index': next_index,
-                'replacement_available': next_index < len(phase_paths),
-                'recorded_utc': datetime.datetime.now(
-                    datetime.timezone.utc).isoformat(),
-            }
-            self.canonical_map_rejections.append(rejection)
-            if next_index < len(phase_paths):
-                self.retry_statistics['canonical_map_replaced'] += 1
-                self.canonical_replacement_round[replacement_key] = next_round
-                rospy.logwarn(
-                    "Canonical map rejected after path_%d failed %d "
-                    "consecutive attempts in env%06d (%s); replacing %s "
-                    "with pool index %d",
-                    self.current_path_id, self.path_retry_count,
-                    self.current_env_id, self.current_phase,
-                    self.external_map_path, next_index)
-                self.finish_active_planning_attempt()
-                self.cancel_timer('next_path_timer')
-                self.write_experiment_manifest()
-                rospy.Timer(
-                    rospy.Duration(self.publish_delay),
-                    self.regenerate_current_environment, oneshot=True)
-                return True
-
-            rospy.logfatal(
-                "Canonical map rejected after path_%d failed %d "
-                "consecutive attempts in env%06d (%s); replacement pool "
-                "exhausted. Retry statistics: %s",
+            # A canonical map is the result of manual review. A run of failed
+            # planning attempts identifies an unsuitable pose pair/profile,
+            # not a reason to discard that map. Keep the map loaded, start a
+            # new sampling round for this path, and relax only this path's
+            # profile after each retry batch.
+            self.retry_statistics['canonical_path_resampled'] += 1
+            self.current_path_profile_retry_round = min(
+                self.current_path_profile_retry_round + 1, 2)
+            rospy.logwarn(
+                "Canonical map retained after path_%d failed %d "
+                "consecutive attempts in env%06d; resampling this path "
+                "with profile retry round %d",
                 self.current_path_id, self.path_retry_count,
-                self.current_env_id, self.current_phase,
-                self.retry_statistics)
+                self.current_env_id, self.current_path_profile_retry_round)
             self.finish_active_planning_attempt()
-            self.experiment_status = 'map_rejected'
-            self.write_experiment_manifest()
             self.cancel_timer('next_path_timer')
-            rospy.signal_shutdown("canonical map failed planner acceptance")
+            self.current_trajectory = None
+            self.path_retry_count = 0
+            self.current_pose_sampling_profile = None
+            self.write_experiment_manifest()
+            self.schedule_next_path(
+                delay=self.map_ready_delay,
+                reason="canonical map retained after path retries")
             return True
 
         self.retry_statistics['environment_regenerated'] += 1
@@ -3515,14 +4206,16 @@ class TerrainDatasetGenerator:
                 if self.active_attempt_record is not None:
                     self.active_attempt_record['minimum_stability_margin_m'] = (
                         float(validation['minimum_margin']))
-                    
+
         # 输出验证结果统计
         if not invalid_found:
             rospy.loginfo(
                 f"Trajectory validation PASSED: {total_points} points, "
                 "all margins satisfy d_safe")
         else:
-            rospy.logwarn(f"Trajectory validation FAILED: {unstable_count}/{total_points} unstable points detected")
+            rospy.logwarn(
+                "Trajectory validation FAILED: unstable=%d/%d",
+                unstable_count, total_points)
             
         if invalid_found:
             self.retry_statistics['trajectory_unstable'] += 1
@@ -3531,8 +4224,8 @@ class TerrainDatasetGenerator:
                 'trajectory_unstable', unstable_points=unstable_count,
                 trajectory_points=total_points)
             rospy.logwarn(
-                "Trajectory for path_%d is unstable (retry %d); keeping "
-                "strict validation and sampling another pair",
+                "Trajectory for path_%d failed hard validation (retry %d); "
+                "sampling another pair",
                 self.current_path_id, self.path_retry_count)
             self.finish_active_planning_attempt()
             if self.regenerate_if_retry_limit_reached():
@@ -4078,6 +4771,7 @@ class TerrainDatasetGenerator:
         self.current_path_id += 1
         self.paths_generated_for_current_env += 1
         self.path_retry_count = 0
+        self.current_path_profile_retry_round = 0
         
         # 检查当前环境是否完成
         target_paths = self.train_paths_per_env if self.current_phase == 'train' else self.val_paths_per_env
@@ -4564,7 +5258,32 @@ class TerrainDatasetGenerator:
                 pcd = o3d.geometry.PointCloud()
                 pcd.points = o3d.utility.Vector3dVector(points)
                 rospy.loginfo(f"Converted heightmap to point cloud with {len(pcd.points)} points")
-                
+
+            elif self.external_map_format.lower() in ('las', 'laz'):
+                # Keep every finite XYZ return.  Preserve the aligned LAS
+                # labels separately for crop-level forest selection; they do
+                # not filter or alter the raw planner point cloud.
+                (points, source_count, source_bounds,
+                 source_class_counts, source_classification) = (
+                     load_surface_points(
+                         self.external_map_path,
+                         return_classification=True))
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(points)
+                self.external_source_classifications[
+                    self.external_map_path] = source_classification
+                self.external_source_metadata[self.external_map_path] = {
+                    'source_point_count': int(source_count),
+                    'source_bounds': source_bounds,
+                    'source_class_counts': source_class_counts,
+                    'source_classification_field': 'LAS classification',
+                    'source_surface': 'all_finite_XYZ_no_LAS_class_filter',
+                }
+                rospy.loginfo(
+                    "Loaded raw %s source with %d finite XYZ points "
+                    "and aligned LAS classification labels",
+                    self.external_map_format.upper(), len(points))
+
             else:
                 raise ValueError(f"Unsupported external map format: {self.external_map_format}")
             
@@ -4597,9 +5316,12 @@ class TerrainDatasetGenerator:
         rospy.loginfo(f"Actual grid shape: {actual_shape}")
         rospy.loginfo(f"Bounds: {grid_map_data.get('bounds', 'Unknown')}")
         rospy.loginfo(f"Resolution: {grid_map_data.get('resolution', 'Unknown')}")
-        processing_method = (
-            "Audited canonical fitted surface" if self.external_map_is_canonical
-            else "Random translated/rotated point-cloud crop")
+        if self.external_map_is_canonical:
+            processing_method = "Audited canonical fitted surface"
+        elif self.external_map_format.lower() in ('las', 'laz'):
+            processing_method = "Online fitted and quality-gated mother-map crop"
+        else:
+            processing_method = "Random translated/rotated point-cloud crop"
         rospy.loginfo("Processing method: %s", processing_method)
         
         # 验证栅格尺寸
