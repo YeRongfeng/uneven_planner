@@ -84,6 +84,7 @@
     <arg name="high_complexity_fraction" default="0.4"/>
     <arg name="map_ready_delay" default="1.0"/>
     <arg name="max_path_retries_before_regenerate" default="30"/>
+    <arg name="mark_unplannable_canonical" default="false"/>
     <arg name="generation_random_seed" default="-1"/>
     <arg name="map_pcd" default="$(find uneven_map)/maps/empty.pcd"/>
     <arg name="map_file" default=""/>

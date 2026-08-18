@@ -30,12 +30,32 @@ from scipy.ndimage import (
 from scipy.spatial import cKDTree
 
 
-YRF_DEFAULT_COARSE_RESOLUTION = 0.4
+# YRF elevation_generator metre values. They do not scale with our 20 m
+# crop: a 20 m cloud in the simulator still uses 0.2 m voxels and 0.4 m
+# coarse cells, then cubic-interpolates to 0.2 m. Our stored grid is that
+# 0.2 m surface; the 0.05 m planner PCD is sampled afterwards.
 YRF_DEFAULT_VOXEL_SIZE = 0.2
+YRF_DEFAULT_COARSE_RESOLUTION = 0.4
 YRF_DEFAULT_GROUND_BAND_BELOW = 0.25
 YRF_DEFAULT_GROUND_BAND_ABOVE = 0.35
+YRF_DEFAULT_OBSTACLE_BAND_BELOW = 0.25
+YRF_DEFAULT_OBSTACLE_BAND_ABOVE = 2.0
+# Public ALS tiles carry isolated returns hundreds of metres below the
+# crop. YRF takes the per-cell minimum, so one such flyer becomes the
+# ground. A 20 m patch cannot have that relief; drop them before voxelizing.
+YRF_DEFAULT_LOW_FLYER_BELOW = 30.0
 YRF_DEFAULT_ENVELOPE_OUTLIER = 0.75
 YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE = 7
+
+
+def yrf_horizontal_params(resolution=None):
+    """YRF voxel and coarse cell sizes.
+
+    ``resolution`` is the output grid (0.2 m here). It does not change the
+    YRF 0.2 / 0.4 metre internals.
+    """
+    del resolution
+    return YRF_DEFAULT_VOXEL_SIZE, YRF_DEFAULT_COARSE_RESOLUTION
 
 
 def parse_args():
@@ -534,38 +554,75 @@ def fit_grid(xyz, center_x, center_y, size, resolution, radius,
             neighbors)
 
 
+def _upper_median(values):
+    values = np.asarray(values, dtype=np.float64)
+    return float(np.partition(values, len(values) // 2)[len(values) // 2])
+
+
+def drop_low_flyers(xyz, below=YRF_DEFAULT_LOW_FLYER_BELOW):
+    """Remove isolated returns far below the crop median.
+
+    This is not a LAS-class filter and not a tight ground band. It only
+    drops points that cannot be terrain on a 20 m patch.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if below <= 0.0:
+        raise ValueError("low-flyer threshold must be positive")
+    if len(xyz) < 3:
+        return xyz, 0, None
+    reference = float(np.median(xyz[:, 2]))
+    keep = xyz[:, 2] >= reference - below
+    if not np.any(keep) or int(np.count_nonzero(keep)) < 3:
+        return xyz, 0, reference
+    return xyz[keep], int(np.count_nonzero(~keep)), reference
+
+
+def _voxel_centroids(xyz, voxel_size):
+    """PCL VoxelGrid equivalent: centroid of points that share a leaf."""
+    origin = np.min(xyz, axis=0)
+    voxel_indices = np.floor((xyz - origin) / voxel_size).astype(np.int64)
+    unique_voxels, inverse = np.unique(
+        voxel_indices, axis=0, return_inverse=True)
+    voxel_sums = np.zeros((len(unique_voxels), 3), dtype=np.float64)
+    np.add.at(voxel_sums, inverse, xyz)
+    voxel_counts = np.bincount(inverse, minlength=len(unique_voxels))
+    return voxel_sums / voxel_counts[:, None]
+
+
 def fit_yrf_ground_grid(
         xyz, size, resolution,
-        coarse_resolution=YRF_DEFAULT_COARSE_RESOLUTION,
-        voxel_size=YRF_DEFAULT_VOXEL_SIZE,
+        coarse_resolution=None,
+        voxel_size=None,
         ground_below=YRF_DEFAULT_GROUND_BAND_BELOW,
         ground_above=YRF_DEFAULT_GROUND_BAND_ABOVE,
-        envelope_outlier=YRF_DEFAULT_ENVELOPE_OUTLIER,
-        lower_envelope_filter_size=YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE):
+        obstacle_below=YRF_DEFAULT_OBSTACLE_BAND_BELOW,
+        obstacle_above=YRF_DEFAULT_OBSTACLE_BAND_ABOVE,
+        low_flyer_below=YRF_DEFAULT_LOW_FLYER_BELOW):
     """Build the ground grid used by the YRF elevation-generator path.
 
-    YRF first voxelizes the XYZ cloud and takes the minimum return in each
-    coarse cell. A geometry-only low-envelope cleanup removes isolated returns
-    far below their local surface; no LAS class is used. The cleaned minima
-    feed the upper median of the surrounding 3x3 cells, followed by the upper
-    median of returns in the ground band. The coarse elevation is then
-    cubic-interpolated to the requested grid.
+    Same steps as ``grid_transformer.cpp``: XYZ-only VoxelGrid centroids,
+    per-cell min-z, 3x3 upper-median reference, ground-band median elevation,
+    obstacle height from the residual band. No LAS class is used. Voxel and
+    coarse cell stay at YRF's 0.2 m / 0.4 m; the result is interpolated to
+    ``resolution`` (0.2 m on our 20 m maps).
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3 or not len(xyz):
         raise ValueError("xyz must be a non-empty N x 3 array")
-    if size <= 0.0 or resolution <= 0.0 or coarse_resolution <= 0.0:
+    if size <= 0.0 or resolution <= 0.0:
         raise ValueError("size and grid resolutions must be positive")
-    if voxel_size <= 0.0:
-        raise ValueError("voxel_size must be positive")
+    if voxel_size is None or coarse_resolution is None:
+        default_voxel, default_coarse = yrf_horizontal_params(resolution)
+        if voxel_size is None:
+            voxel_size = default_voxel
+        if coarse_resolution is None:
+            coarse_resolution = default_coarse
+    if coarse_resolution <= 0.0 or voxel_size <= 0.0:
+        raise ValueError("voxel_size and coarse_resolution must be positive")
     if ground_below < 0.0 or ground_above < 0.0:
         raise ValueError("ground bands must be non-negative")
-    if envelope_outlier <= 0.0:
-        raise ValueError("envelope_outlier must be positive")
-    if (lower_envelope_filter_size < 1
-            or lower_envelope_filter_size % 2 == 0):
-        raise ValueError(
-            "lower_envelope_filter_size must be a positive odd integer")
+    if obstacle_below < 0.0 or obstacle_above < 0.0:
+        raise ValueError("obstacle bands must be non-negative")
     coarse_cells_float = size / coarse_resolution
     coarse_cells = int(round(coarse_cells_float))
     if not math.isclose(coarse_cells_float, coarse_cells,
@@ -581,18 +638,10 @@ def fit_yrf_ground_grid(
     xyz = xyz[finite]
     if not len(xyz):
         raise ValueError("xyz contains no finite points")
+    xyz, low_flyer_count, low_flyer_reference = drop_low_flyers(
+        xyz, below=low_flyer_below)
 
-    # PCL VoxelGrid uses voxel centroids.  The local minimum is equivalent to
-    # the voxel origin for this crop and keeps the operation independent of the
-    # source CRS magnitude.
-    voxel_origin = np.min(xyz, axis=0)
-    voxel_indices = np.floor((xyz - voxel_origin) / voxel_size).astype(np.int64)
-    unique_voxels, inverse = np.unique(
-        voxel_indices, axis=0, return_inverse=True)
-    voxel_sums = np.zeros((len(unique_voxels), 3), dtype=np.float64)
-    np.add.at(voxel_sums, inverse, xyz)
-    voxel_counts = np.bincount(inverse, minlength=len(unique_voxels))
-    processed = voxel_sums / voxel_counts[:, None]
+    processed = _voxel_centroids(xyz, voxel_size)
 
     half = size * 0.5
     origin = -half
@@ -609,106 +658,127 @@ def fit_yrf_ground_grid(
     np.minimum.at(
         cell_min,
         (selected[:, 1], selected[:, 0]),
-        processed[:, 2][inside],
+        processed[inside, 2],
     )
     cell_observed = np.isfinite(cell_min)
     if not np.any(cell_observed):
         raise ValueError("xyz has no coarse grid support")
 
-    # Keep the YRF lower-envelope construction, but remove gross low returns
-    # present in these forest LAS tiles before deriving the 3x3 reference.
-    # This is geometric cleanup, not a LAS-class filter.
-    nearest_indices = distance_transform_edt(
-        ~cell_observed, return_distances=False, return_indices=True)
-    envelope = cell_min[tuple(nearest_indices)]
-    envelope = median_filter(envelope, size=3, mode="nearest")
-    neighbourhood = median_filter(
-        envelope, size=lower_envelope_filter_size, mode="nearest")
-    low_outlier = envelope < neighbourhood - envelope_outlier
-    envelope[low_outlier] = neighbourhood[low_outlier]
-
-    def upper_median(values):
-        values = np.asarray(values, dtype=np.float64)
-        return float(np.partition(values, len(values) // 2)[len(values) // 2])
-
+    # YRF: 3x3 upper median of observed cell minima only. Empty cells stay
+    # empty; they are not nearest-filled before the reference is taken.
     ground_reference = np.full_like(cell_min, np.nan)
     for row in range(coarse_cells):
         for column in range(coarse_cells):
-            neighbours = envelope[
+            neighbours = cell_min[
                 max(0, row - 1):min(coarse_cells, row + 2),
                 max(0, column - 1):min(coarse_cells, column + 2)]
             neighbours = neighbours[np.isfinite(neighbours)]
             if len(neighbours):
-                ground_reference[row, column] = upper_median(neighbours)
+                ground_reference[row, column] = _upper_median(neighbours)
 
     elevation_coarse = np.full_like(ground_reference, np.nan)
+    obstacle_height_coarse = np.zeros_like(cell_min, dtype=np.float64)
     ground_counts = np.zeros_like(cell_min, dtype=np.int32)
-    for row in range(coarse_cells):
-        for column in range(coarse_cells):
-            if not np.isfinite(ground_reference[row, column]):
-                continue
-            cell = (
-                inside
-                & (indices[:, 0] == column)
-                & (indices[:, 1] == row))
-            if not np.any(cell):
-                continue
-            residual = processed[cell, 2] - ground_reference[row, column]
-            ground = processed[cell, 2][
-                (residual >= -ground_below) & (residual <= ground_above)]
-            ground_counts[row, column] = len(ground)
-            elevation_coarse[row, column] = (
-                upper_median(ground)
-                if len(ground) else ground_reference[row, column])
+    point_counts = np.zeros_like(cell_min, dtype=np.int32)
+    inside_z = processed[inside, 2]
+    cell_key = selected[:, 1] * coarse_cells + selected[:, 0]
+    order = np.argsort(cell_key, kind="mergesort")
+    sorted_keys = cell_key[order]
+    sorted_z = inside_z[order]
+    starts = np.flatnonzero(np.diff(sorted_keys, prepend=-1))
+    ends = np.append(starts[1:], len(sorted_keys))
+    for start, end in zip(starts, ends):
+        key = int(sorted_keys[start])
+        row, column = divmod(key, coarse_cells)
+        point_counts[row, column] = end - start
+        reference = ground_reference[row, column]
+        if not np.isfinite(reference):
+            continue
+        cell_z = sorted_z[start:end]
+        residual = cell_z - reference
+        ground = cell_z[(residual >= -ground_below) & (residual <= ground_above)]
+        ground_counts[row, column] = len(ground)
+        elevation_coarse[row, column] = (
+            _upper_median(ground) if len(ground) else reference)
+        obstacle = residual[
+            (residual >= obstacle_below) & (residual <= obstacle_above)]
+        if len(obstacle):
+            obstacle_height_coarse[row, column] = float(np.max(obstacle))
 
     coarse_valid = np.isfinite(elevation_coarse)
     if not np.any(coarse_valid):
         raise ValueError("YRF ground split produced no finite coarse cells")
-    # The simulator leaves cells without returns empty.  Canonical maps need a
-    # complete 20 m sidecar, so only those unsupported coarse cells are filled
-    # before applying the same cubic elevation interpolation.
+    # Simulator leaves empty cells as NaN. Canonical 20 m maps need a complete
+    # sidecar, so only those unsupported cells are filled.
     elevation_coarse = complete_elevation_surface(
         elevation_coarse, coarse_valid)
+    obstacle_mask_coarse = obstacle_height_coarse > 0.0
 
     fine_axis = origin + (np.arange(fine_cells) + 0.5) * resolution
-    coarse_axis = origin + (np.arange(coarse_cells) + 0.5) * coarse_resolution
     fine_x, fine_y = np.meshgrid(fine_axis, fine_axis)
-    columns = (fine_x.ravel() - coarse_axis[0]) / coarse_resolution
-    rows = (fine_y.ravel() - coarse_axis[0]) / coarse_resolution
-    coordinates = np.vstack((rows, columns))
-    elevation = map_coordinates(
-        elevation_coarse, coordinates, order=3, mode="nearest",
-    ).reshape(fine_cells, fine_cells)
-    observed = map_coordinates(
-        (ground_counts > 0).astype(np.uint8), coordinates, order=0,
-        mode="nearest",
-    ).reshape(fine_cells, fine_cells).astype(bool)
-    neighbors = map_coordinates(
-        ground_counts.astype(np.float64), coordinates, order=0,
-        mode="nearest",
-    ).reshape(fine_cells, fine_cells).astype(np.int32)
+    same_grid = (
+        coarse_cells == fine_cells
+        and math.isclose(coarse_resolution, resolution,
+                         rel_tol=0.0, abs_tol=1e-12))
+    if same_grid:
+        elevation = elevation_coarse
+        observed = point_counts > 0
+        neighbors = ground_counts
+        obstacle_height = obstacle_height_coarse
+        obstacle_mask = obstacle_mask_coarse
+        interpolation = "none; coarse cell equals output cell"
+    else:
+        coarse_axis = origin + (np.arange(coarse_cells) + 0.5) * coarse_resolution
+        columns = (fine_x.ravel() - coarse_axis[0]) / coarse_resolution
+        rows = (fine_y.ravel() - coarse_axis[0]) / coarse_resolution
+        coordinates = np.vstack((rows, columns))
+        elevation = map_coordinates(
+            elevation_coarse, coordinates, order=3, mode="nearest",
+        ).reshape(fine_cells, fine_cells)
+        observed = map_coordinates(
+            (point_counts > 0).astype(np.uint8), coordinates, order=0,
+            mode="nearest",
+        ).reshape(fine_cells, fine_cells).astype(bool)
+        neighbors = map_coordinates(
+            ground_counts.astype(np.float64), coordinates, order=0,
+            mode="nearest",
+        ).reshape(fine_cells, fine_cells).astype(np.int32)
+        obstacle_height = map_coordinates(
+            obstacle_height_coarse, coordinates, order=0, mode="nearest",
+        ).reshape(fine_cells, fine_cells)
+        obstacle_mask = map_coordinates(
+            obstacle_mask_coarse.astype(np.uint8), coordinates, order=0,
+            mode="nearest",
+        ).reshape(fine_cells, fine_cells) > 0
+        interpolation = "cubic elevation; nearest support/obstacle"
+
     normals = normals_from_elevation(elevation, resolution)
     valid = np.ones_like(observed, dtype=bool)
     diagnostics = {
         "fit_method": "yrf_ground_reference",
-        "fit_point_scope": "finite XYZ after 0.2m voxel centroids",
+        "fit_point_scope": (
+            f"finite XYZ after {voxel_size:.2f}m voxel centroids"),
         "voxel_size_m": float(voxel_size),
         "coarse_resolution_m": float(coarse_resolution),
         "ground_reference": "3x3 upper median of coarse-cell minima",
-        "ground_height": "upper median of returns in [-0.25m, +0.35m]",
-        "lower_envelope_cleanup": (
-            "3-cell median followed by "
-            f"{lower_envelope_filter_size}x{lower_envelope_filter_size} "
-            "local lower-outlier replacement"),
-        "lower_envelope_outlier_m": float(envelope_outlier),
-        "lower_envelope_outlier_cells": int(np.count_nonzero(low_outlier)),
+        "ground_height": (
+            f"upper median of returns in [-{ground_below:.2f}m, "
+            f"+{ground_above:.2f}m]"),
         "ground_band_below_m": float(ground_below),
         "ground_band_above_m": float(ground_above),
+        "obstacle_band_below_m": float(obstacle_below),
+        "obstacle_band_above_m": float(obstacle_above),
+        "low_flyer_below_m": float(low_flyer_below),
+        "low_flyer_reference_m": low_flyer_reference,
+        "low_flyer_removed": int(low_flyer_count),
         "voxel_point_count": int(len(processed)),
         "coarse_observed_fraction": float(cell_observed.mean()),
         "coarse_ground_fraction": float(np.mean(ground_counts > 0)),
         "ground_candidate_count": int(np.sum(ground_counts)),
-        "interpolation": "cubic elevation; nearest support/count mask",
+        "obstacle_cell_count": int(np.count_nonzero(obstacle_mask)),
+        "interpolation": interpolation,
+        "obstacle_mask": obstacle_mask,
+        "obstacle_height": obstacle_height,
     }
     return (fine_x, fine_y, elevation, normals, valid, observed, neighbors,
             diagnostics)

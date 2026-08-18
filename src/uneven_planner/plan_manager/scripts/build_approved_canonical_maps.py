@@ -36,7 +36,7 @@ from prepare_laz_terrain_map import (
     write_binary_pcd,
 )
 from terrain_map_quality import evaluate
-from review_slots import active_records, resolve_slots
+from review_slots import active_records, filled_records, resolve_slots
 
 
 def parse_args():
@@ -80,6 +80,9 @@ def parse_args():
     parser.add_argument(
         "--overwrite", action="store_true",
         help="Clear the selected non-empty output directory before rebuilding")
+    parser.add_argument(
+        "--only-filled-slots", action="store_true",
+        help="Rebuild only maps that currently occupy a filled replacement slot")
     parser.add_argument(
         "--replacement-file", type=Path,
         help="JSONL log of returned canonical slots")
@@ -190,6 +193,46 @@ def write_one(record, line_number, split, index, source_points, source_info,
     }
 
 
+def existing_result(record, line_number, split, index, output_dir):
+    stem = output_dir / split / f"map_{index:03d}"
+    map_path = stem.with_suffix(".pcd")
+    metadata_path = stem.with_suffix(".json")
+    if not map_path.is_file() or not metadata_path.is_file():
+        return None
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return {
+        "line": line_number,
+        "split": split,
+        "source_id": record.get("source_id") or (
+            (metadata.get("manual_review") or {}).get("source_id", "")),
+        "source_path": str(Path(
+            record.get("source_path") or metadata.get("source_file") or "")),
+        "map_path": str(map_path.resolve()),
+        "center_xy": record.get("center_xy") or metadata.get("source_center_xy"),
+        "yaw_deg": record.get("yaw_deg", metadata.get("crop_yaw_deg")),
+        "source_points_in_crop": int(
+            ((metadata.get("manual_review") or {}).get("stats") or {}).get(
+                "source_points_in_crop", 0)),
+        "source_support_coverage": float(
+            metadata.get("source_support_coverage", 0.0)),
+        "quality": metadata.get("quality") or {},
+        "reused_existing": True,
+    }
+
+
+def already_built_for_record(record, line_number, split, index, output_dir):
+    metadata_path = output_dir / split / f"map_{index:03d}.json"
+    if not metadata_path.is_file():
+        return False
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("approval_record_line") != line_number:
+        return False
+    filled = record.get("fills_slot")
+    if filled and metadata.get("filled_slot") != filled:
+        return False
+    return True
+
+
 def main():
     cli = parse_args()
     review_file = cli.review_file.resolve()
@@ -219,6 +262,9 @@ def main():
     active = active_records(slot_state)
     if not active:
         raise RuntimeError("The review file contains no approved regions")
+    filled_keys = {key for key, _, _ in filled_records(slot_state)}
+    if cli.only_filled_slots and not filled_keys:
+        raise RuntimeError("没有已补位的地图可生成")
 
     ordered_records = []
     for (split, index), line_number, record in active:
@@ -240,13 +286,16 @@ def main():
     if output_dir.exists() and not output_dir.is_dir():
         raise NotADirectoryError(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
-        if not cli.overwrite:
+        if cli.only_filled_slots:
+            pass
+        elif not cli.overwrite:
             raise FileExistsError(f"Refusing to overwrite non-empty {output_dir}")
-        for child in output_dir.iterdir():
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+        else:
+            for child in output_dir.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     global_indices = {
@@ -256,7 +305,29 @@ def main():
 
     results = []
     source_cache = {}
+    rebuilt = 0
     for line_number, record, split, site_id, index in ordered_records:
+        reuse_existing = (
+            cli.only_filled_slots
+            and (
+                (split, index) not in filled_keys
+                or already_built_for_record(
+                    record, line_number, split, index, output_dir)))
+        if reuse_existing:
+            result = existing_result(
+                record, line_number, split, index, output_dir)
+            if result is None:
+                if (split, index) not in filled_keys:
+                    print(
+                        f"{split} map_{index:03d}: no existing file, skipped",
+                        flush=True)
+                    continue
+            else:
+                results.append(result)
+                print(
+                    f"{split} map_{index:03d}: reused existing canonical map",
+                    flush=True)
+                continue
         source_path = Path(record["source_path"]).resolve()
         if source_path not in source_cache:
             print(f"Loading {source_path}", flush=True)
@@ -271,6 +342,7 @@ def main():
             record, line_number, split, index, source_points, source_info,
             cli, output_dir, site_id)
         results.append(result)
+        rebuilt += 1
         quality = result["quality"]
         print(
             f"{split} map_{index:03d}: line={line_number}, "
@@ -289,6 +361,8 @@ def main():
         "review_file": str(review_file),
         "replacement_file": str(replacement_file),
         "replacement_count": len(slot_state["replacement_records"]),
+        "only_filled_slots": bool(cli.only_filled_slots),
+        "rebuilt_count": rebuilt if cli.only_filled_slots else len(results),
         "parameters": {
             "size_m": cli.size,
             "resolution_m": cli.resolution,
@@ -325,6 +399,8 @@ def main():
     print(json.dumps({
         "output_dir": str(output_dir),
         "approved_count": len(results),
+        "rebuilt_count": rebuilt if cli.only_filled_slots else len(results),
+        "only_filled_slots": bool(cli.only_filled_slots),
         "train_maps": global_indices["train"],
         "val_maps": global_indices["val"],
         "manifest": str(output_dir / "approved_canonical_manifest.json"),

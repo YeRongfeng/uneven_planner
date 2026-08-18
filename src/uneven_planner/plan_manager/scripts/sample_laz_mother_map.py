@@ -3,10 +3,10 @@
 
 The source is loaded once, but no fixed crop list is required. Candidate
 centres and yaw angles are sampled deterministically from raw source support.
-The continuous 100 x 100 grid is fitted from a geometry-only lower envelope,
-while the retained planner PCD contains that fitted surface together with all
-finite raw XYZ returns in the crop. No LAS class filter or obstacle layer is
-written. Only quality-passing scenes are retained; every attempted location
+The continuous 100 x 100 grid is fitted with the YRF elevation-generator
+path at this map's cell size. The retained planner PCD contains that fitted
+surface together with all finite raw XYZ returns in the crop. LAS class is
+not used. Only quality-passing scenes are retained; every attempted location
 and rejection reason is recorded in a manifest.
 """
 
@@ -222,12 +222,10 @@ def build_surface(exact, padded, args):
             padded,
             args.size,
             args.resolution,
-            coarse_resolution=args.yrf_coarse_resolution,
-            voxel_size=args.yrf_voxel_size,
+            coarse_resolution=getattr(args, "yrf_coarse_resolution", None),
+            voxel_size=getattr(args, "yrf_voxel_size", None),
             ground_below=args.ground_band_below,
             ground_above=args.ground_band_above,
-            envelope_outlier=args.envelope_outlier,
-            lower_envelope_filter_size=args.yrf_lower_envelope_filter_size,
         )
         ground_candidate_count = split_diagnostics["ground_candidate_count"]
     else:
@@ -284,6 +282,8 @@ def build_surface(exact, padded, args):
         "ground_candidate_count": int(ground_candidate_count),
         "split_diagnostics": split_diagnostics,
         "fit_method": fit_method,
+        "obstacle_mask": split_diagnostics.get("obstacle_mask"),
+        "obstacle_height": split_diagnostics.get("obstacle_height"),
     }
 
 
@@ -316,17 +316,19 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
         "planner_pcd": "dense completed fitted surface plus supported raw XYZ returns",
     }
     if fit_method == "yrf_ground":
+        diagnostics = surface.get("split_diagnostics") or {}
         processing.update({
             "ground_fit_support": (
-                "YRF 0.2m voxel centroids + 0.4m lower envelope + 3x3 "
-                "upper-median reference + ground-band median"),
-            "fit": "YRF-compatible coarse ground reference and cubic elevation interpolation",
-            "yrf_voxel_size_m": args.yrf_voxel_size,
-            "yrf_coarse_resolution_m": args.yrf_coarse_resolution,
-            "yrf_lower_envelope_filter_size": (
-                args.yrf_lower_envelope_filter_size),
+                "YRF voxel centroids + cell min-z + 3x3 upper-median "
+                "reference + ground-band median"),
+            "fit": "YRF 0.2m voxel / 0.4m coarse, cubic to this map's 0.2m grid",
+            "yrf_voxel_size_m": diagnostics.get(
+                "voxel_size_m", getattr(args, "yrf_voxel_size", None)),
+            "yrf_coarse_resolution_m": diagnostics.get(
+                "coarse_resolution_m",
+                getattr(args, "yrf_coarse_resolution", None)),
             "gap_completion": (
-                "coarse unsupported-cell completion followed by cubic elevation interpolation"),
+                "unsupported-cell completion; cubic only if coarse != output"),
         })
     else:
         processing.update({
@@ -384,8 +386,7 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
 
 def save_npz(path, surface, args, center, yaw):
     normals = surface["normals"]
-    np.savez_compressed(
-        path,
+    payload = dict(
         elevation=surface["elevation"].astype(np.float32),
         normal_x=normals[:, :, 0].astype(np.float32),
         normal_y=normals[:, :, 1].astype(np.float32),
@@ -399,6 +400,14 @@ def save_npz(path, surface, args, center, yaw):
         crop_yaw_rad=np.float64(yaw),
         vertical_origin=np.float64(surface["vertical_origin"]),
     )
+    obstacle_mask = surface.get("obstacle_mask")
+    obstacle_height = surface.get("obstacle_height")
+    if obstacle_mask is not None:
+        payload["obstacle_mask"] = np.asarray(obstacle_mask, dtype=bool)
+    if obstacle_height is not None:
+        payload["obstacle_height"] = np.asarray(
+            obstacle_height, dtype=np.float32)
+    np.savez_compressed(path, **payload)
 
 
 def write_sampling_manifest(output_dir, input_path, source_info, args,

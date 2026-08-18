@@ -316,7 +316,7 @@ def run_final_generation(args, canonical_path, domain):
         "crop_max_attempts": "1",
         "generation_random_seed": str(
             args.seed if args.seed >= 0 else int(time.time())),
-        "max_path_retries_before_regenerate": "12",
+        "max_path_retries_before_regenerate": "30",
         "enable_rviz": "false",
     }
     command = ["roslaunch", "plan_manager",

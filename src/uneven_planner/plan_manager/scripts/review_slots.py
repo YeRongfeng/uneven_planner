@@ -67,11 +67,35 @@ def _newer(existing, candidate):
     return candidate if _event_time(candidate[1]) >= _event_time(existing[1]) else existing
 
 
+def _deletion_target(record):
+    if record.get("decision") != "delete":
+        return None
+    timestamp = (record.get("target_timestamp_utc")
+                 or record.get("review_timestamp_utc"))
+    source_id = record.get("source_id")
+    if not isinstance(timestamp, str) or not timestamp or not source_id:
+        return None
+    return str(source_id), timestamp
+
+
+def _deleted_targets(review_records):
+    result = {}
+    for line_number, record in review_records:
+        target = _deletion_target(record)
+        if target is not None:
+            result[target] = _newer(result.get(target), (line_number, record))
+    return result
+
+
 def _baseline_records(review_records, source_splits=None):
     """Assign old approval records using the builder's historical ordering."""
+    deleted_targets = _deleted_targets(review_records)
     grouped = OrderedDict()
     for line_number, record in review_records:
         if record.get("decision") != "approve" or fill_slot(record) is not None:
+            continue
+        target = (record.get("source_id", ""), record.get("timestamp_utc", ""))
+        if target in deleted_targets:
             continue
         split = record.get("split")
         if split is None and source_splits:
@@ -103,12 +127,14 @@ def resolve_slots(review_path, replacement_path=None, source_splits=None):
     """Return occupied, filled, and pending canonical slots.
 
     A ``return`` review event creates a pending slot.  An approval carrying
-    ``fills_slot`` takes that exact slot.  Existing canonical replacement
-    records are treated as pending because those maps were generated without a
-    new human approval.
+    ``fills_slot`` takes that exact slot.  A ``delete`` event removes its
+    target approval without creating a new slot.  Existing canonical
+    replacement records are treated as pending because those maps were
+    generated without a new human approval.
     """
     review_records = read_jsonl(review_path)
     replacement_records = read_jsonl(replacement_path) if replacement_path else []
+    deleted_targets = _deleted_targets(review_records)
     baseline = _baseline_records(review_records, source_splits)
 
     returns = {}
@@ -129,6 +155,10 @@ def resolve_slots(review_path, replacement_path=None, source_splits=None):
     for line_number, record in review_records:
         slot = fill_slot(record)
         if slot is not None and record.get("decision") == "approve":
+            target = (record.get("source_id", ""),
+                      record.get("timestamp_utc", ""))
+            if target in deleted_targets:
+                continue
             fills[slot] = _newer(fills.get(slot), (line_number, record))
 
     keys = set(baseline) | set(returns) | set(fills)
@@ -167,6 +197,7 @@ def resolve_slots(review_path, replacement_path=None, source_splits=None):
         "open_slots": open_slots(slots),
         "review_records": review_records,
         "replacement_records": replacement_records,
+        "deleted_targets": deleted_targets,
     }
 
 
@@ -197,4 +228,13 @@ def active_records(state):
             key=lambda item: (SPLITS.index(item[0][0]), item[0][1])):
         if entry.get("status") == "occupied":
             result.append((key, entry["line_number"], entry["record"]))
+    return result
+
+
+def filled_records(state):
+    """Occupied slots that currently come from a human fill, not the baseline."""
+    result = []
+    for key, line_number, record in active_records(state):
+        if fill_slot(record) is not None or state["slots"][key].get("filled"):
+            result.append((key, line_number, record))
     return result

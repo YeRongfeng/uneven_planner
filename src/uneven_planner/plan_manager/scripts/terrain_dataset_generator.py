@@ -1790,6 +1790,8 @@ class TerrainDatasetGenerator:
             rospy.get_param('~map_ready_delay', 1.0))
         self.max_path_retries_before_regenerate = int(
             rospy.get_param('~max_path_retries_before_regenerate', 30))
+        self.mark_unplannable_canonical = bool(
+            rospy.get_param('~mark_unplannable_canonical', False))
         if self.map_ready_delay < 0.0:
             raise ValueError("map_ready_delay must be non-negative")
         
@@ -1798,6 +1800,8 @@ class TerrainDatasetGenerator:
         self.current_path_id = 0
         self.current_phase = self.start_phase  # 'train' or 'val'
         self.paths_generated_for_current_env = 0
+        self.scene_failed_attempts = 0
+        self._env_skip_status = None
         self.waiting_for_result = False
         self.current_trajectory = None
         self.map_update_timeout = rospy.get_param('~map_update_timeout', 10.0)
@@ -2912,16 +2916,40 @@ class TerrainDatasetGenerator:
             env_dir = os.path.join(self.val_dir, env_name)
         
         os.makedirs(env_dir, exist_ok=True)
+        import glob
+        self._env_skip_status = None
+        if self.external_map_is_canonical:
+            skip_status = self.canonical_env_skip_status(env_dir)
+            if skip_status:
+                self._env_skip_status = skip_status
+                existing = glob.glob(os.path.join(env_dir, "path_*.p"))
+                self.current_path_id = len(existing)
+                self.paths_generated_for_current_env = len(existing)
+                rospy.loginfo(
+                    "Skipping %s %s (%s, existing paths=%d)",
+                    self.current_phase, env_name, skip_status, len(existing))
+                return env_dir
+            existing = sorted(glob.glob(os.path.join(env_dir, "path_*.p")))
+            if existing:
+                self.current_path_id = len(existing)
+                self.paths_generated_for_current_env = len(existing)
+                rospy.loginfo(
+                    "Resuming %s %s from path_%d",
+                    self.current_phase, env_name, self.current_path_id)
+            else:
+                self.current_path_id = 0
+                self.paths_generated_for_current_env = 0
         
         # 如果重新生成，清理旧的路径文件但保留目录结构
-        import glob
-        path_files = glob.glob(os.path.join(env_dir, "path_*.p"))
-        for path_file in path_files:
-            try:
-                os.remove(path_file)
-                rospy.loginfo(f"Removed old path file: {os.path.basename(path_file)}")
-            except OSError:
-                pass
+        if not (self.external_map_is_canonical
+                and self.paths_generated_for_current_env > 0):
+            path_files = glob.glob(os.path.join(env_dir, "path_*.p"))
+            for path_file in path_files:
+                try:
+                    os.remove(path_file)
+                    rospy.loginfo(f"Removed old path file: {os.path.basename(path_file)}")
+                except OSError:
+                    pass
         
         rospy.loginfo(f"Generating environment {env_name} for {self.current_phase} phase")
         
@@ -3386,15 +3414,18 @@ class TerrainDatasetGenerator:
         
         # 更新期望的环境和路径ID
         self.expected_env_id = self.current_env_id
-        self.expected_path_id = 0
+        self.expected_path_id = self.current_path_id
         
         # 不在这里进行固定阻塞等待。调用方会使用单个可配置的短定时器；
         # 若地图确实尚未就绪，规划器会立即返回失败并由统一重试逻辑处理。
         
-        # 重置路径计数
-        self.current_path_id = 0
-        self.paths_generated_for_current_env = 0
+        if not (self.external_map_is_canonical
+                and self.paths_generated_for_current_env > 0):
+            self.current_path_id = 0
+            self.paths_generated_for_current_env = 0
         self.current_path_profile_retry_round = 0
+        self.scene_failed_attempts = 0
+        self.expected_path_id = self.current_path_id
 
         return env_dir
     
@@ -4024,6 +4055,147 @@ class TerrainDatasetGenerator:
         if reason:
             rospy.logdebug("Scheduled next path in %.3fs (%s)", delay, reason)
 
+    def current_phase_path_target(self):
+        return (self.train_paths_per_env if self.current_phase == 'train'
+                else self.val_paths_per_env)
+
+    def canonical_env_skip_status(self, env_dir):
+        """Return why a canonical env should not be planned, or None."""
+        if os.path.isfile(os.path.join(env_dir, "needs_return.json")):
+            return "needs_return"
+        existing = len(glob.glob(os.path.join(env_dir, "path_*.p")))
+        if existing >= self.current_phase_path_target():
+            return "complete"
+        if self.mark_unplannable_canonical and existing >= 1:
+            return "already_tested"
+        return None
+
+    def current_env_dir(self):
+        env_name = f"env{self.current_env_id:06d}"
+        phase_dir = (
+            self.train_dir if self.current_phase == 'train' else self.val_dir)
+        return os.path.join(phase_dir, env_name)
+
+    def mark_canonical_needs_return(self, reason):
+        """Write a skip marker so 8765 can ask for a human return."""
+        env_dir = self.current_env_dir()
+        os.makedirs(env_dir, exist_ok=True)
+        payload = {
+            "needs_return": True,
+            "reason": reason,
+            "split": self.current_phase,
+            "env_id": int(self.current_env_id),
+            "map_path": self.external_map_path,
+            "paths_saved": int(self.paths_generated_for_current_env),
+            "scene_failed_attempts": int(self.scene_failed_attempts),
+            "path_retries": int(self.path_retry_count),
+        }
+        marker = os.path.join(env_dir, "needs_return.json")
+        with open(marker, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        map_path = self.external_map_path
+        if map_path:
+            meta_path = os.path.splitext(map_path)[0] + ".json"
+            if os.path.isfile(meta_path):
+                with open(meta_path, encoding="utf-8") as stream:
+                    metadata = json.load(stream)
+                metadata["needs_return"] = True
+                metadata["needs_return_reason"] = reason
+                with open(meta_path, "w", encoding="utf-8") as stream:
+                    json.dump(metadata, stream, indent=2, ensure_ascii=False)
+                    stream.write("\n")
+
+    def clear_canonical_needs_return(self, env_dir=None):
+        env_dir = env_dir or self.current_env_dir()
+        marker = os.path.join(env_dir, "needs_return.json")
+        if os.path.isfile(marker):
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+        map_path = getattr(self, "external_map_path", None)
+        if not map_path:
+            return
+        meta_path = os.path.splitext(map_path)[0] + ".json"
+        if not os.path.isfile(meta_path):
+            return
+        with open(meta_path, encoding="utf-8") as stream:
+            metadata = json.load(stream)
+        if not metadata.get("needs_return"):
+            return
+        metadata["needs_return"] = False
+        metadata.pop("needs_return_reason", None)
+        with open(meta_path, "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+
+    def finish_current_phase(self):
+        """Move train→val or env→next after this phase is done or skipped."""
+        if self.current_phase == 'train':
+            if self.stop_after_train:
+                self.finish_active_planning_attempt()
+                self.current_trajectory = None
+                self.experiment_status = 'completed'
+                self.write_experiment_manifest()
+                rospy.loginfo(
+                    "Train-only generation completed! Retry statistics: %s",
+                    self.retry_statistics)
+                rospy.signal_shutdown("train-only generation completed")
+                return
+            self.finish_active_planning_attempt()
+            self.current_trajectory = None
+            self.current_phase = 'val'
+            self.current_path_id = 0
+            self.paths_generated_for_current_env = 0
+            self.current_path_profile_retry_round = 0
+            self.path_retry_count = 0
+            self.scene_failed_attempts = 0
+            self.generate_new_environment()
+            if self._env_skip_status:
+                self.finish_current_phase()
+                return
+            self.schedule_next_path(
+                delay=self.map_ready_delay,
+                reason="independent validation environment ready")
+            return
+
+        self.finish_active_planning_attempt()
+        self.current_trajectory = None
+        self.current_env_id += 1
+        self.current_phase = 'train'
+        self.current_path_id = 0
+        self.paths_generated_for_current_env = 0
+        self.current_path_profile_retry_round = 0
+        self.path_retry_count = 0
+        self.scene_failed_attempts = 0
+        if self.current_env_id >= self.start_env_id + self.num_environments:
+            self.experiment_status = 'completed'
+            self.write_experiment_manifest()
+            rospy.loginfo(
+                "Dataset generation completed! Retry statistics: %s",
+                self.retry_statistics)
+            rospy.signal_shutdown("Dataset generation completed")
+            return
+        self.cancel_timer('next_path_timer')
+        rospy.Timer(rospy.Duration(1.0), self.start_new_environment, oneshot=True)
+
+    def skip_unplannable_canonical_map(self):
+        """Stop retrying a canonical map that produced no trajectory."""
+        self.retry_statistics['canonical_map_rejected'] += 1
+        reason = "no_valid_trajectory"
+        rospy.logwarn(
+            "Canonical %s env%06d still has 0 trajectories after %d "
+            "start-goal attempts; marking for human return and skipping",
+            self.current_phase, self.current_env_id,
+            self.scene_failed_attempts)
+        self.finish_active_planning_attempt()
+        self.cancel_timer('next_path_timer')
+        self.current_trajectory = None
+        self.mark_canonical_needs_return(reason)
+        self.write_experiment_manifest()
+        self.finish_current_phase()
+
     def regenerate_if_retry_limit_reached(self):
         """
         当前裁剪区域长期无法生成合格路径时，重新裁剪整个环境。
@@ -4036,20 +4208,22 @@ class TerrainDatasetGenerator:
             return False
 
         if self.external_map_is_canonical:
-            # A canonical map is the result of manual review. A run of failed
-            # planning attempts identifies an unsuitable pose pair/profile,
-            # not a reason to discard that map. Keep the map loaded, start a
-            # new sampling round for this path, and relax only this path's
-            # profile after each retry batch.
+            if (self.mark_unplannable_canonical
+                    and self.paths_generated_for_current_env == 0):
+                # Test generation only: this scene swapped start/goal pairs
+                # for a full retry budget and still saved nothing.
+                self.skip_unplannable_canonical_map()
+                return True
+            # The scene can produce trajectories. Keep replacing failed
+            # pairs and do not skip it later.
             self.retry_statistics['canonical_path_resampled'] += 1
             self.current_path_profile_retry_round = min(
                 self.current_path_profile_retry_round + 1, 2)
-            rospy.logwarn(
-                "Canonical map retained after path_%d failed %d "
-                "consecutive attempts in env%06d; resampling this path "
-                "with profile retry round %d",
-                self.current_path_id, self.path_retry_count,
-                self.current_env_id, self.current_path_profile_retry_round)
+            rospy.loginfo(
+                "Canonical env%06d already has %d trajectories; "
+                "continuing after %d failed pairs on path_%d",
+                self.current_env_id, self.paths_generated_for_current_env,
+                self.path_retry_count, self.current_path_id)
             self.finish_active_planning_attempt()
             self.cancel_timer('next_path_timer')
             self.current_trajectory = None
@@ -4058,7 +4232,7 @@ class TerrainDatasetGenerator:
             self.write_experiment_manifest()
             self.schedule_next_path(
                 delay=self.map_ready_delay,
-                reason="canonical map retained after path retries")
+                reason="canonical scene kept after a failed pair batch")
             return True
 
         self.retry_statistics['environment_regenerated'] += 1
@@ -4092,6 +4266,7 @@ class TerrainDatasetGenerator:
         else:
             self.retry_statistics['planning_failed'] += 1
             self.path_retry_count += 1
+            self.scene_failed_attempts += 1
             self.finish_attempt_record('planning_failed')
             rospy.logwarn(
                 "Planning failed for path_%d (retry %d); sampling a new "
@@ -4146,6 +4321,7 @@ class TerrainDatasetGenerator:
             rospy.logwarn(f"Invalid or empty trajectory for path_{self.current_path_id}, retrying...")
             self.retry_statistics['empty_trajectory'] += 1
             self.path_retry_count += 1
+            self.scene_failed_attempts += 1
             self.finish_attempt_record('empty_trajectory')
             self.finish_active_planning_attempt()
             if self.regenerate_if_retry_limit_reached():
@@ -4220,6 +4396,7 @@ class TerrainDatasetGenerator:
         if invalid_found:
             self.retry_statistics['trajectory_unstable'] += 1
             self.path_retry_count += 1
+            self.scene_failed_attempts += 1
             self.finish_attempt_record(
                 'trajectory_unstable', unstable_points=unstable_count,
                 trajectory_points=total_points)
@@ -4722,6 +4899,7 @@ class TerrainDatasetGenerator:
             rospy.logwarn(f"Invalid trajectory for path_{self.current_path_id}, retrying...")
             self.retry_statistics['empty_trajectory'] += 1
             self.path_retry_count += 1
+            self.scene_failed_attempts += 1
             self.schedule_next_path(reason="trajectory processing failed")
             return
         
@@ -4772,61 +4950,16 @@ class TerrainDatasetGenerator:
         self.paths_generated_for_current_env += 1
         self.path_retry_count = 0
         self.current_path_profile_retry_round = 0
+        if self.paths_generated_for_current_env == 1:
+            self.clear_canonical_needs_return()
         
         # 检查当前环境是否完成
         target_paths = self.train_paths_per_env if self.current_phase == 'train' else self.val_paths_per_env
         
         if self.paths_generated_for_current_env >= target_paths:
             rospy.loginfo(f"Completed {self.current_phase} phase for environment {self.current_env_id}")
-            
-            if self.current_phase == 'train':
-                if self.stop_after_train:
-                    self.finish_active_planning_attempt()
-                    self.current_trajectory = None
-                    self.experiment_status = 'completed'
-                    self.write_experiment_manifest()
-                    rospy.loginfo(
-                        "Train-only generation completed! Retry statistics: %s",
-                        self.retry_statistics)
-                    rospy.signal_shutdown("train-only generation completed")
-                    return
-                # val拥有独立地图；多源地图时还会避开同index train所用源。
-                self.finish_active_planning_attempt()
-                self.current_trajectory = None
-                
-                self.current_phase = 'val'
-                self.current_path_id = 0
-                self.paths_generated_for_current_env = 0
-                self.generate_new_environment()
-                self.schedule_next_path(
-                    delay=self.map_ready_delay,
-                    reason="independent validation environment ready")
-                return
-            else:
-                # 当前环境完全完成，移动到下一个环境
-                # 清理待处理状态，防止旧轨迹干扰新环境
-                self.finish_active_planning_attempt()
-                self.current_trajectory = None
-                
-                self.current_env_id += 1
-                self.current_phase = 'train'
-                self.current_path_id = 0
-                self.paths_generated_for_current_env = 0
-                
-                # 检查是否所有环境都已完成
-                if self.current_env_id >= self.start_env_id + self.num_environments:
-                    self.experiment_status = 'completed'
-                    self.write_experiment_manifest()
-                    rospy.loginfo(
-                        "Dataset generation completed! Retry statistics: %s",
-                        self.retry_statistics)
-                    rospy.signal_shutdown("Dataset generation completed")
-                    return
-                
-                # 生成新环境
-                self.cancel_timer('next_path_timer')
-                rospy.Timer(rospy.Duration(1.0), self.start_new_environment, oneshot=True)
-                return
+            self.finish_current_phase()
+            return
         
         # 生成当前环境的下一条路径
         self.schedule_next_path(reason="previous path saved")
@@ -4868,8 +5001,10 @@ class TerrainDatasetGenerator:
     
     def start_new_environment(self, event):
         """开始新环境"""
-        env_dir = self.generate_new_environment()
-        # 延迟后开始生成路径
+        self.generate_new_environment()
+        if self._env_skip_status:
+            self.finish_current_phase()
+            return
         self.schedule_next_path(
             delay=self.map_ready_delay, reason="new environment ready")
     

@@ -398,13 +398,10 @@ class SourceData:
     def fit(self, center_x, center_y, size, yaw_deg):
         """Fit the same YRF ground surface used by canonical generation."""
         from prepare_laz_terrain_map import (
-            YRF_DEFAULT_COARSE_RESOLUTION,
-            YRF_DEFAULT_ENVELOPE_OUTLIER,
             YRF_DEFAULT_GROUND_BAND_ABOVE,
             YRF_DEFAULT_GROUND_BAND_BELOW,
-            YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE,
-            YRF_DEFAULT_VOXEL_SIZE,
             fit_yrf_ground_grid,
+            yrf_horizontal_params,
         )
         from sample_laz_mother_map import grid_coverage
 
@@ -416,17 +413,16 @@ class SourceData:
             raise ValueError("candidate contains no points for fitting")
 
         resolution = 0.20
+        voxel_size, coarse_resolution = yrf_horizontal_params(resolution)
         (local_x, local_y, elevation, normals, valid, observed, neighbors,
          split_diagnostics) = fit_yrf_ground_grid(
             padded,
             size,
             resolution,
-            coarse_resolution=YRF_DEFAULT_COARSE_RESOLUTION,
-            voxel_size=YRF_DEFAULT_VOXEL_SIZE,
+            coarse_resolution=coarse_resolution,
+            voxel_size=voxel_size,
             ground_below=YRF_DEFAULT_GROUND_BAND_BELOW,
             ground_above=YRF_DEFAULT_GROUND_BAND_ABOVE,
-            envelope_outlier=YRF_DEFAULT_ENVELOPE_OUTLIER,
-            lower_envelope_filter_size=YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE,
         )
         valid = np.asarray(valid, dtype=bool)
         elevation = np.asarray(elevation, dtype=np.float64)
@@ -452,28 +448,34 @@ class SourceData:
             "size_m": float(size),
             "yaw_deg": float(yaw_deg),
             "method": (
-                "canonical YRF ground fit: 0.2m voxel centroids + cleaned "
-                "0.4m lower envelope + 3x3 upper-median reference + cubic "
-                "interpolation"),
+                "YRF elevation-generator fit on a 20 m crop: "
+                f"{voxel_size:.2f}m voxel centroids, "
+                f"{coarse_resolution:.2f}m cell min-z, "
+                f"3x3 upper-median reference, cubic to {resolution:.2f}m"),
             "vertical_origin_m": vertical_origin,
             "stats": {
                 "raw_points_in_candidate": int(len(exact)),
                 "raw_points_in_fit_margin": int(len(padded)),
-                "fit_point_scope": (
-                    "finite XYZ after 0.2m voxel centroids; YRF ground band"),
+                "fit_point_scope": split_diagnostics["fit_point_scope"],
                 "fit_points": int(split_diagnostics["ground_candidate_count"]),
                 "fit_point_fraction": float(
                     split_diagnostics["ground_candidate_count"] / len(padded)),
                 "classification_policy": (
-                    "all LAS classes loaded; geometric low-envelope cleanup"),
-                "surface_cell_size_m": YRF_DEFAULT_COARSE_RESOLUTION,
+                    "all finite XYZ; LAS class not used"),
+                "surface_cell_size_m": coarse_resolution,
+                "voxel_size_m": voxel_size,
+                "coarse_resolution_m": coarse_resolution,
                 "ground_band_below_m": YRF_DEFAULT_GROUND_BAND_BELOW,
                 "ground_band_above_m": YRF_DEFAULT_GROUND_BAND_ABOVE,
-                "envelope_outlier_m": YRF_DEFAULT_ENVELOPE_OUTLIER,
-                "lower_envelope_filter_size": (
-                    YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE),
-                "split_diagnostics": split_diagnostics,
-                "robust_refinement": "YRF cubic elevation interpolation",
+                "low_flyer_removed": int(
+                    split_diagnostics.get("low_flyer_removed", 0)),
+                "low_flyer_below_m": float(
+                    split_diagnostics.get("low_flyer_below_m", 30.0)),
+                "split_diagnostics": {
+                    key: value for key, value in split_diagnostics.items()
+                    if key not in {"obstacle_mask", "obstacle_height"}
+                },
+                "robust_refinement": split_diagnostics["interpolation"],
                 "raw_grid_coverage_1m": float(
                     grid_coverage(exact, size, 1.0)),
                 "observed_fraction": float(np.mean(observed)),
@@ -1218,8 +1220,8 @@ HTML_TEMPLATE = r'''<!doctype html>
     <div class="section"><h2>生成训练用地图</h2>
       <div class="workflow-copy">把你标记为“通过”的区域制作成训练程序能使用的地图文件。这是自动中间步骤，点击按钮即可，下一步会自动使用生成结果。</div>
       <div id="canonicalInfo" class="workflow-path">等待人工筛选结果</div>
-      <div class="generation-action"><button id="exportCanonical">生成训练用地图</button><label><input id="overwriteCanonical" type="checkbox">覆盖已有训练用地图</label></div>
-      <div class="hint">勾选后会清空上面保存位置中的旧中间地图，再按当前审核记录重新生成；不勾选时已有文件会被保留并拒绝覆盖。</div>
+      <div class="generation-action"><button id="exportCanonical">生成训练用地图</button><label><input id="overwriteCanonical" type="checkbox">覆盖已有训练用地图</label><label><input id="onlyFilledSlots" type="checkbox">仅生成已补位的地图</label></div>
+      <div class="hint">“覆盖已有”会清空旧中间地图再全量重建。“仅生成已补位”只重写打回后已经补上的那个编号，例如 val/map_026 就是 map_026。</div>
       <details class="advanced"><summary>更改训练地图的保存位置</summary>
         <div class="workflow-copy">通常不需要修改。这里保存的是中间地图，不是最终训练数据。</div>
         <div class="control full path-control"><span class="path-label">训练地图文件夹</span><div class="path-row"><input id="canonicalDir" spellcheck="false"><button id="browseCanonicalDir">浏览</button></div></div>
@@ -1227,9 +1229,10 @@ HTML_TEMPLATE = r'''<!doctype html>
       </details>
     </div>
     <div class="section"><h2>生成最终训练数据</h2>
-      <div class="workflow-copy">使用上一步的训练用地图，生成最终的训练集、验证集和轨迹。第一次使用时直接点击按钮即可。</div>
+      <div class="workflow-copy">先用测试生成检查每张图能不能出轨迹，再正式生成。测试通过或补位之后，正式生成不再打回。</div>
       <div id="datasetInfo" class="workflow-path">请先完成上一步</div>
-      <button id="generateDataset">生成最终训练数据</button>
+      <div class="generation-action"><button id="testDataset">测试生成（每张1条）</button><button id="generateDataset">生成最终训练数据</button><label><input id="onlyFilledDataset" type="checkbox">仅生成已补位地图的轨迹</label></div>
+      <div class="hint">测试生成：每张图先出 1 条，换 30 对起终点仍为 0 条则标「需要打回」并跳过。正式生成不再打回，只给未完成的图补全轨迹；已标打回的图会跳过。</div>
       <details class="advanced"><summary>调整生成数量或保存位置</summary>
         <div class="control full path-control"><span class="path-label">最终数据文件夹</span><div class="path-row"><input id="datasetDir" spellcheck="false"><button id="browseDatasetDir">浏览</button></div></div>
         <div class="control full generation-counts"><label>训练集轨迹数/每张地图<input id="trainPaths" type="number" min="1" step="1" value="100"></label><label>验证集轨迹数/每张地图<input id="valPaths" type="number" min="1" step="1" value="10"></label></div>
@@ -1302,7 +1305,7 @@ function threeColor(i,data,mode,source,crop,baseZ,zMin,zMax){const actual=mode==
 function addRawThreePoints(view,data,source,crop,selection,baseZ,verticalScale){const count=data.count;if(!count)return;let zMin=Infinity,zMax=-Infinity;for(let i=0;i<count;i++){const z=data.z[i]+crop.origin_z;zMin=Math.min(zMin,z);zMax=Math.max(zMax,z)}const a=selection.yaw_deg*Math.PI/180,ca=Math.cos(a),sa=Math.sin(a),positions=new Float32Array(count*3),colors=new Float32Array(count*3);for(let i=0;i<count;i++){const gx=crop.origin_xy[0]+data.x[i],gy=crop.origin_xy[1]+data.y[i],dx=gx-selection.center_xy[0],dy=gy-selection.center_xy[1],lx=ca*dx+sa*dy,ly=-sa*dx+ca*dy;positions[i*3]=lx;positions[i*3+1]=(data.z[i]+crop.origin_z-baseZ)*verticalScale;positions[i*3+2]=ly;threeColor(i,data,$('colorMode').value,source,crop,baseZ,zMin,zMax).toArray(colors,i*3)}const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.BufferAttribute(colors,3));const material=new THREE.PointsMaterial({size:Math.max(.06,selection.size_m*.008),sizeAttenuation:true,vertexColors:true,transparent:true,opacity:.9});view.group.add(new THREE.Points(geometry,material));return {zMin,zMax}}
 function addFitThreePoints(view,fit,verticalScale){const grid=fit.grid,x=typed(grid.x,'f4'),y=typed(grid.y,'f4'),z=typed(grid.z,'f4'),valid=typed(grid.valid,'u8'),positions=[],colors=[],range=fit.stats.elevation_range_m;for(let i=0;i<valid.length;i++){if(!valid[i])continue;positions.push(x[i],z[i]*verticalScale,y[i]);const t=Math.max(0,Math.min(1,(z[i]-range[0])/(range[1]-range[0]||1)));const c=new THREE.Color().setHSL(.52-.42*t,.82,.55);colors.push(c.r,c.g,c.b)}const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));const material=new THREE.PointsMaterial({size:.07,sizeAttenuation:true,vertexColors:true,transparent:true,opacity:.78});view.group.add(new THREE.Points(geometry,material))}
 function renderCrop3d(){const wrap=$('crop3dWrap'),empty=wrap.querySelector('.empty');if(!state.crop){$('crop3d').hidden=true;$('threeHint').hidden=true;empty.hidden=false;if(state.three)clearThreeGroup(state.three);return}const view=initThreeView();if(!view){$('crop3d').hidden=true;$('threeHint').hidden=true;empty.hidden=false;empty.textContent='3D 组件未加载，仍可使用左侧二维视图';return}$('crop3d').hidden=false;$('threeHint').hidden=false;empty.hidden=true;clearThreeGroup(view);const visibleFit=state.fit&&state.displayMode==='fit',fitRange=visibleFit?.stats?.elevation_range_m||null,reference=state.crop.stats.reference_z_range||state.crop.stats.class_1_plus_2_z_range||null,referenceRange=reference?.z_range||state.crop.stats.z_range||1,groundRange=fitRange?Math.max(.1,fitRange[1]-fitRange[0]):Math.max(.1,referenceRange),verticalScale=Math.max(.5,Math.min(4,state.selection.size_m/Math.max(groundRange*2,state.selection.size_m*.25)));view.group.scale.set(1,1,1);const baseZ=visibleFit?state.fit.vertical_origin_m:reference?.z_min??state.crop.origin_z;addRawThreePoints(view,state.crop.points,state.source.summary,state.crop,state.selection,baseZ,verticalScale);if(visibleFit)addFitThreePoints(view,state.fit,verticalScale);const floor=new THREE.GridHelper(state.selection.size_m,10,0x49616b,0x263840);floor.material.transparent=true;floor.material.opacity=.45;view.group.add(floor);const axis=new THREE.AxesHelper(state.selection.size_m*.3);view.group.add(axis);view.group.scale.y=1;view.target.set(0,Math.max(0,groundRange*verticalScale*.25),0);view.distance=Math.max(state.selection.size_m*1.55,groundRange*verticalScale*2.6);view.yaw=.8;view.pitch=.55;view.render()}
-function fitSummaryHtml(){if(!state.fit)return'';const s=state.fit.stats;return`<div class="fit-summary"><div>候选区原始点 ${s.raw_points_in_fit_margin.toLocaleString()} 点，参与拟合 ${s.fit_points.toLocaleString()} 点</div><div>${s.classification_policy}；仅剔除低于下包络 ${s.ground_band_below_m.toFixed(2)} m 的低噪声点，不设置上方高度上限</div><div>高程网格观测 ${(s.observed_fraction*100).toFixed(1)}% · 高程范围 ${s.elevation_range_m[0].toFixed(2)}–${s.elevation_range_m[1].toFixed(2)} m</div><div>坡度 median ${s.slope_degrees.median.toFixed(1)}° / p95 ${s.slope_degrees.p95.toFixed(1)}° / max ${s.slope_degrees.maximum.toFixed(1)}°</div></div>`}
+function fitSummaryHtml(){if(!state.fit)return'';const s=state.fit.stats,voxel=s.voxel_size_m??0.2,coarse=s.coarse_resolution_m??s.surface_cell_size_m??0.4,grid=s.grid_resolution_m??0.2,flyers=s.low_flyer_removed||0,flyerLine=flyers?`<div>滤除低于裁块中位数 ${(s.low_flyer_below_m??30).toFixed(0)} m 的超低噪声 ${flyers} 点</div>`:'';return`<div class="fit-summary"><div>候选区原始点 ${s.raw_points_in_fit_margin.toLocaleString()} 点，参与拟合 ${s.fit_points.toLocaleString()} 点</div><div>${s.classification_policy}；YRF 地面带 [−${s.ground_band_below_m.toFixed(2)}, +${s.ground_band_above_m.toFixed(2)}] m</div><div>体素 ${voxel.toFixed(2)} m · 粗网格 ${coarse.toFixed(2)} m · 输出 ${grid.toFixed(2)} m（20 m 裁块，算法尺度与仿真相同）</div>${flyerLine}<div>高程网格观测 ${(s.observed_fraction*100).toFixed(1)}% · 高程范围 ${s.elevation_range_m[0].toFixed(2)}–${s.elevation_range_m[1].toFixed(2)} m</div><div>坡度 median ${s.slope_degrees.median.toFixed(1)}° / p95 ${s.slope_degrees.p95.toFixed(1)}° / max ${s.slope_degrees.maximum.toFixed(1)}°</div></div>`}
 function setStatus(text){$('status').textContent=text}
 async function responseJson(response){let payload;try{payload=await response.json()}catch(_){payload={error:await response.text()}}if(!response.ok)throw new Error(payload.error||`HTTP ${response.status}`);return payload}
 async function postJson(url,body){return responseJson(await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}))}
@@ -1331,16 +1334,18 @@ async function openPicker(target,mode,filters=[]){pickerState.target=target;pick
 function choosePickerDirectory(){if(pickerState.mode!=='directory')return;const target=pickerState.target;$(target).value=pickerState.path;if(target==='canonicalDir')$('manifestPath').value=`${pickerState.path}/approved_canonical_manifest.json`;closePicker();if(target==='loadPath')loadRoot().catch(e=>setStatus('加载已有地图失败：'+e.message))}
 function choosePickerPath(){if(pickerState.mode!=='directory')return;const target=pickerState.target,path=$('pickerPath').value.trim();if(!path)return;$(target).value=path;if(target==='canonicalDir')$('manifestPath').value=`${path}/approved_canonical_manifest.json`;closePicker();if(target==='loadPath')loadRoot().catch(e=>setStatus('加载已有地图失败：'+e.message))}
 async function refreshCatalog(preferredId=''){const payload=await responseJson(await fetch('/api/index'));SOURCES=payload.sources;CONFIG.review_file=payload.review_file;CONFIG.dataset_viewer_url=payload.dataset_viewer_url;updateWorkflowLinks(payload);const target=renderSourceOptions(preferredId);if(target)loadSource(target).catch(e=>setStatus('刷新后加载失败：'+e.message))}
-	function jobText(job){if(!job)return'当前没有运行任务';const names={canonical_export:'训练用地图生成',dataset_generation:'最终训练数据生成'};const stateText=job.running?'运行中':job.returncode===0?'已完成':`已结束（返回码 ${job.returncode}）`;const log=job.returncode&&job.returncode!==0?`\n详细日志：${job.log_path}`:'';return`${names[job.kind]||'后台生成'} · ${stateText}${log}\n\n${job.tail||'等待日志…'}`}
+	function jobText(job){if(!job)return'当前没有运行任务';const names={canonical_export:'训练用地图生成',dataset_generation:'最终训练数据生成',dataset_test:'测试生成（每张1条）'};const stateText=job.running?'运行中':job.returncode===0?'已完成':`已结束（返回码 ${job.returncode}）`;const log=job.returncode&&job.returncode!==0?`\n详细日志：${job.log_path}`:'';return`${names[job.kind]||'后台生成'} · ${stateText}${log}\n\n${job.tail||'等待日志…'}`}
 async function refreshJobs(){try{const jobs=await responseJson(await fetch('/api/jobs')),job=jobs.length?jobs[jobs.length-1]:null;$('jobStatus').textContent=jobText(job);$('stopJob').disabled=!job||!job.running;if(job&&job.running)window.setTimeout(refreshJobs,1000)}catch(e){$('jobStatus').textContent='读取任务状态失败：'+e.message}}
 async function importMaps(){const files=$('mapFiles').files;if(!files.length)return;const form=new FormData();form.append('domain',$('domain').value);form.append('site','imported');for(const file of files)form.append('map_files',file,file.name);setStatus('正在导入原始地图…');const payload=await responseJson(await fetch('/api/import',{method:'POST',body:form}));$('loadPath').value=payload.review_input;await refreshCatalog(payload.source_ids?.[0]||'');setStatus(`已导入 ${payload.files.length} 个原始地图文件`);$('mapFiles').value=''}
 async function importReview(){const file=$('reviewFile').files[0];if(!file)return;const form=new FormData();form.append('domain',$('domain').value);form.append('review_file',file,file.name);setStatus('正在导入标注备份…');const payload=await responseJson(await fetch('/api/import-review',{method:'POST',body:form}));$('reviewPath').value=payload.review_file;await refreshCatalog();setStatus('标注备份已导入并加载');$('reviewFile').value=''}
 async function loadRoot(){const path=$('loadPath').value.trim();if(!path){setStatus('请先选择一个已有地图文件夹');return}setStatus('正在读取已有地图…');const payload=await postJson('/api/load-root',{path});await refreshCatalog(payload.source_ids?.[0]||'');setStatus('已有地图已加载')}
 async function switchReview(){const path=$('reviewPath').value.trim();if(!path){setStatus('请先选择标注记录文件');return}setStatus('正在加载标注记录…');await postJson('/api/load-review',{path});await refreshCatalog();setStatus('标注记录已加载')}
-function exportBody(){const domain=$('domain').value.trim()||'terrain';return{output_dir:$('canonicalDir').value.trim(),domain,train_site_id:$('trainSiteId').value.trim()||`${domain}_train`,val_site_id:$('valSiteId').value.trim()||`${domain}_val`,train_source_profile:$('trainProfile').value,val_source_profile:$('valProfile').value,overwrite:$('overwriteCanonical').checked}}
+function exportBody(){const domain=$('domain').value.trim()||'terrain';return{output_dir:$('canonicalDir').value.trim(),domain,train_site_id:$('trainSiteId').value.trim()||`${domain}_train`,val_site_id:$('valSiteId').value.trim()||`${domain}_val`,train_source_profile:$('trainProfile').value,val_source_profile:$('valProfile').value,overwrite:$('overwriteCanonical').checked,only_filled_slots:$('onlyFilledSlots').checked}}
 async function exportCanonical(){const body=exportBody();if(!body.output_dir){setStatus('请在高级设置中选择训练地图保存位置');return}setStatus('正在生成训练用地图…');const job=await postJson('/api/export-canonical',body);$('manifestPath').value=`${body.output_dir}/approved_canonical_manifest.json`;$('jobStatus').textContent=jobText(job);refreshJobs()}
-async function generateDataset(){const manifest=$('manifestPath').value.trim()||`${$('canonicalDir').value.trim()}/approved_canonical_manifest.json`,body={manifest_path:manifest,output_dir:$('datasetDir').value.trim(),train_paths:+$('trainPaths').value,val_paths:+$('valPaths').value,workers:+$('workers').value,ros_port:+$('rosPort').value};if(!body.manifest_path||!body.output_dir){setStatus('请先在高级设置中选择最终数据保存位置');return}setStatus('正在生成最终训练数据…');const job=await postJson('/api/generate-dataset',body);$('jobStatus').textContent=jobText(job);refreshJobs()}
-const exportCanonicalWithDomainCheck=exportCanonical;exportCanonical=async function(){if(!ensureDomainConfirmed())return;return exportCanonicalWithDomainCheck()};const generateDatasetWithDomainCheck=generateDataset;generateDataset=async function(){if(!ensureDomainConfirmed())return;return generateDatasetWithDomainCheck()}
+function datasetBody(test){const manifest=$('manifestPath').value.trim()||`${$('canonicalDir').value.trim()}/approved_canonical_manifest.json`;return{manifest_path:manifest,output_dir:$('datasetDir').value.trim(),train_paths:test?1:+$('trainPaths').value,val_paths:test?1:+$('valPaths').value,workers:+$('workers').value,ros_port:+$('rosPort').value,only_filled_slots:$('onlyFilledDataset').checked,test_generation:Boolean(test)}}
+async function generateDataset(){const body=datasetBody(false);if(!body.manifest_path||!body.output_dir){setStatus('请先在高级设置中选择最终数据保存位置');return}setStatus('正在生成最终训练数据…');const job=await postJson('/api/generate-dataset',body);$('jobStatus').textContent=jobText(job);refreshJobs()}
+async function testDataset(){const body=datasetBody(true);if(!body.manifest_path||!body.output_dir){setStatus('请先在高级设置中选择最终数据保存位置');return}setStatus('正在测试生成（每张1条）…');const job=await postJson('/api/generate-dataset',body);$('jobStatus').textContent=jobText(job);refreshJobs()}
+const exportCanonicalWithDomainCheck=exportCanonical;exportCanonical=async function(){if(!ensureDomainConfirmed())return;return exportCanonicalWithDomainCheck()};const generateDatasetWithDomainCheck=generateDataset;generateDataset=async function(){if(!ensureDomainConfirmed())return;return generateDatasetWithDomainCheck()};const testDatasetWithDomainCheck=testDataset;testDataset=async function(){if(!ensureDomainConfirmed())return;return testDatasetWithDomainCheck()}
 function renderSource(){const s=currentSummary();if(!s)return;$('sourceMeta').innerHTML=`<div>目录：${s.source_category||'未分类'}</div><div>来源：${sourceLabel(s)}</div><div>${s.point_count.toLocaleString()} 个点 · ${s.has_rgb?'含 RGB 原色':'无 RGB 字段'}</div><div>分类：${s.has_classification?'有':'无'} · 强度：${s.has_intensity?'有':'无'}</div>`;const counts=state.source.review_counts||{approve:0,reject:0};$('approved').textContent=counts.approve;$('rejected').textContent=counts.reject;$('colorMode').value=s.has_rgb?'auto':'classification';$('colorMode').querySelector('option[value="rgb"]').disabled=!s.has_rgb;$('legend').innerHTML=s.has_rgb?'<span><i style="background:#fff"></i>原始 RGB</span>':'<span><i style="background:#76b852"></i>class 2</span><span><i style="background:#f5a623"></i>class 1</span><span>颜色为 LAS 分类回退</span>';renderOpenSlots();renderReviewHistory();fit()}
 const classNames={0:'从未分类',1:'未分类',2:'地面',3:'低植被',4:'中植被',5:'高植被',6:'建筑物',7:'低点/噪声',8:'模型关键点',9:'水体',10:'铁路',11:'道路表面',12:'重叠点',18:'高噪声'};
 function classTable(counts,ranges,total,allRange){const entries=Object.entries(counts||{}).sort((a,b)=>+a[0]-+b[0]);if(!entries.length)return`<table class="class-table"><thead><tr><th>类别</th><th>点数</th><th>高差</th></tr></thead><tbody><tr><td>全部点（无 LAS 分类）</td><td>${Number(total||0).toLocaleString()}</td><td>${rangeText(allRange)}</td></tr></tbody></table>`;return'<table class="class-table"><thead><tr><th>类别</th><th>点数</th><th>高差</th></tr></thead><tbody>'+entries.map(([k,v])=>`<tr><td>class ${k} · ${classNames[k]||'其他 LAS 类别'}</td><td>${Number(v).toLocaleString()}</td><td>${rangeText(ranges?.[k])}</td></tr>`).join('')+'</tbody></table>'}
@@ -1378,7 +1383,7 @@ $('toggleRight').addEventListener('click',()=>{$('app').classList.toggle('audit-
 $('showAllReviews').addEventListener('change',()=>{renderReviewHistory();draw()});
  $('selectAllReviews').addEventListener('change',e=>{for(const {record} of visibleSelectableReviews()){if(e.target.checked)state.selectedReviewTimestamps.add(record.timestamp_utc);else state.selectedReviewTimestamps.delete(record.timestamp_utc)};syncBulkReviewControls();renderReviewHistory()});$('reviewHistory').addEventListener('change',e=>{const checkbox=e.target.closest('.history-select');if(!checkbox||!state.source)return;const record=state.source.review_records[Number(checkbox.dataset.reviewIndex)];if(!record||!reviewIsSelectable(record))return;if(checkbox.checked)state.selectedReviewTimestamps.add(record.timestamp_utc);else state.selectedReviewTimestamps.delete(record.timestamp_utc);syncBulkReviewControls()});$('reviewHistory').addEventListener('click',e=>{if(e.target.closest('.history-select'))return;const button=e.target.closest('.history-open');if(!button||!state.source)return;loadReview(state.source.review_records[Number(button.dataset.reviewIndex)])});$('bulkUpdateReview').addEventListener('click',()=>updateSelectedReviewSplits().catch(x=>setStatus('批量更新归属失败：'+x.message)));
  $('confirmDomain').addEventListener('click',()=>confirmDomain().catch(x=>setStatus('切换审核记录失败：'+x.message)));$('startDatasetViewer').addEventListener('click',()=>startDatasetViewer().catch(x=>setStatus('启动结果查看器失败：'+x.message)));$('openDatasetViewer').addEventListener('click',openDatasetViewer);$('stopDatasetViewer').addEventListener('click',()=>stopDatasetViewer().catch(x=>setStatus('关闭结果查看器失败：'+x.message)));
- $('importMap').addEventListener('click',()=>$('mapFiles').click());$('mapFiles').addEventListener('change',()=>importMaps().catch(e=>setStatus('导入原始地图失败：'+e.message)));$('chooseReview').addEventListener('click',()=>$('reviewFile').click());$('reviewFile').addEventListener('change',()=>importReview().catch(e=>setStatus('导入标注备份失败：'+e.message)));$('loadRoot').addEventListener('click',()=>openPicker('loadPath','directory').catch(e=>setStatus('选择地图文件夹失败：'+e.message)));$('refreshCatalog').addEventListener('click',()=>refreshCatalog(state.sourceId).catch(e=>setStatus('重新读取失败：'+e.message)));$('switchReview').addEventListener('click',()=>switchReview().catch(e=>setStatus('加载标注记录失败：'+e.message)));$('exportCanonical').addEventListener('click',()=>exportCanonical().catch(e=>setStatus('生成训练用地图失败：'+e.message)));$('generateDataset').addEventListener('click',()=>generateDataset().catch(e=>setStatus('生成最终训练数据失败：'+e.message)));$('stopJob').addEventListener('click',()=>postJson('/api/stop-job',{}).then(refreshJobs).catch(e=>setStatus('停止生成失败：'+e.message)));
+ $('importMap').addEventListener('click',()=>$('mapFiles').click());$('mapFiles').addEventListener('change',()=>importMaps().catch(e=>setStatus('导入原始地图失败：'+e.message)));$('chooseReview').addEventListener('click',()=>$('reviewFile').click());$('reviewFile').addEventListener('change',()=>importReview().catch(e=>setStatus('导入标注备份失败：'+e.message)));$('loadRoot').addEventListener('click',()=>openPicker('loadPath','directory').catch(e=>setStatus('选择地图文件夹失败：'+e.message)));$('refreshCatalog').addEventListener('click',()=>refreshCatalog(state.sourceId).catch(e=>setStatus('重新读取失败：'+e.message)));$('switchReview').addEventListener('click',()=>switchReview().catch(e=>setStatus('加载标注记录失败：'+e.message)));$('exportCanonical').addEventListener('click',()=>exportCanonical().catch(e=>setStatus('生成训练用地图失败：'+e.message)));$('generateDataset').addEventListener('click',()=>generateDataset().catch(e=>setStatus('生成最终训练数据失败：'+e.message)));$('testDataset').addEventListener('click',()=>testDataset().catch(e=>setStatus('测试生成失败：'+e.message)));$('stopJob').addEventListener('click',()=>postJson('/api/stop-job',{}).then(refreshJobs).catch(e=>setStatus('停止生成失败：'+e.message)));
  $('browseReviewPath').addEventListener('click',()=>openPicker('reviewPath','file',['.jsonl','.ndjson']).catch(e=>setStatus('选择标注记录失败：'+e.message)));$('browseCanonicalDir').addEventListener('click',()=>openPicker('canonicalDir','directory').catch(e=>setStatus('选择保存文件夹失败：'+e.message)));$('browseManifest').addEventListener('click',()=>openPicker('manifestPath','file',['.json']).catch(e=>setStatus('选择程序清单失败：'+e.message)));$('browseDatasetDir').addEventListener('click',()=>openPicker('datasetDir','directory').catch(e=>setStatus('选择保存文件夹失败：'+e.message)));$('closePicker').addEventListener('click',closePicker);$('pickerUp').addEventListener('click',()=>{if(pickerState.parent)browsePicker(pickerState.parent).catch(e=>setStatus('打开文件夹失败：'+e.message))});$('pickerGo').addEventListener('click',()=>browsePicker($('pickerPath').value).catch(e=>setStatus('打开文件夹失败：'+e.message)));$('usePickerPath').addEventListener('click',choosePickerPath);$('usePickerDirectory').addEventListener('click',choosePickerDirectory);$('pathPicker').addEventListener('click',e=>{if(e.target===$('pathPicker'))closePicker()});
 const drawCurrentSelection=drawSelection;drawSelection=()=>{drawReviewMarkers();drawCurrentSelection()};
 function initialiseWorkflow(){const domain=CONFIG.default_domain||'terrain';$('domain').value=domain;$('site').value='imported';$('trainSiteId').value=`${domain}_train`;$('valSiteId').value=`${domain}_val`;setLeftTab('map');updateRightButton();updateReviewControls();updateWorkflowLinks({sources:SOURCES,review_file:CONFIG.review_file,default_domain:domain,dataset_viewer_url:CONFIG.dataset_viewer_url,workspace_root:CONFIG.workspace_root});renderSourceOptions();refreshJobs();refreshCatalog().catch(e=>setStatus('初始化失败：'+e.message))}
@@ -1453,6 +1458,8 @@ def make_handler(catalog, html, workspace, default_domain,
             ]
             if bool(body.get("overwrite", False)):
                 command.append("--overwrite")
+            if bool(body.get("only_filled_slots", False)):
+                command.append("--only-filled-slots")
             log_path = Path(str(output_dir) + ".logs") / "web-canonical-export.log"
             return jobs.start("canonical_export", command, workspace, log_path)
 
@@ -1471,7 +1478,13 @@ def make_handler(catalog, html, workspace, default_domain,
             }
             if any(value <= 0 for value in values.values()):
                 raise ValueError("generation counts, workers and ROS port must be positive")
+            test_generation = bool(body.get("test_generation", False))
             command = [
+                "env",
+                "ONLY_FILLED_SLOTS=1" if bool(body.get("only_filled_slots", False))
+                else "ONLY_FILLED_SLOTS=0",
+                "TEST_GENERATION=1" if test_generation else "TEST_GENERATION=0",
+                "ALLOW_EXISTING=1",
                 "bash",
                 str(workspace / "src/uneven_planner/plan_manager/scripts"
                     / "generate_approved_canonical_dataset.sh"),
@@ -1482,8 +1495,10 @@ def make_handler(catalog, html, workspace, default_domain,
                 str(values["workers"]),
                 str(values["ros_port"]),
             ]
-            log_path = Path(str(output_dir) + ".logs") / "web-generation.log"
-            return jobs.start("dataset_generation", command, workspace, log_path)
+            log_name = "web-test-generation.log" if test_generation else "web-generation.log"
+            log_path = Path(str(output_dir) + ".logs") / log_name
+            kind = "dataset_test" if test_generation else "dataset_generation"
+            return jobs.start(kind, command, workspace, log_path)
 
         def start_dataset_viewer(self, body):
             dataset_root = resolve_workspace_path(

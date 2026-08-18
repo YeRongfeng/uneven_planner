@@ -184,6 +184,7 @@ class DatasetCatalog:
                 "score": quality.get("geometry_score"),
                 "quality": quality.get("quality"),
                 "quality_metrics": quality.get("metrics", {}),
+                "needs_return": bool(metadata.get("needs_return")),
                 "metadata": metadata,
             }
             self.summary_cache[map_path] = (modified, summary)
@@ -222,6 +223,8 @@ class DatasetCatalog:
             "score": quality.get("geometry_score"),
             "quality": quality.get("quality"),
             "quality_metrics": quality.get("metrics", {}),
+            "needs_return": (map_path.parent / "needs_return.json").is_file()
+            or bool(metadata.get("needs_return")),
             "metadata": metadata,
         }
         self.summary_cache[map_path] = (modified, summary)
@@ -236,9 +239,13 @@ class DatasetCatalog:
                 summary = self.base_summary(map_path)
                 paths, latest = self.path_state(map_path)
                 summary["path_count"] = len(paths)
+                if map_path.suffix != ".npz":
+                    summary["needs_return"] = (
+                        (map_path.parent / "needs_return.json").is_file()
+                        or bool(summary.get("needs_return")))
                 summary["live_token"] = (
                     f"{summary['artifact']}:{map_path.stat().st_mtime_ns}:"
-                    f"{len(paths)}:{latest}")
+                    f"{len(paths)}:{latest}:{int(bool(summary.get('needs_return')))}")
                 scenes.append(summary)
             self.summary_cache = {
                 path: value for path, value in self.summary_cache.items()
@@ -265,9 +272,11 @@ class DatasetCatalog:
             record["domain"] = summary["domain"]
             record["artifact"] = summary["artifact"]
             record["path_count"] = len(paths)
+            record["needs_return"] = bool(
+                summary.get("needs_return") or record.get("needs_return"))
             record["live_token"] = (
                 f"{summary['artifact']}:{map_path.stat().st_mtime_ns}:"
-                f"{len(paths)}:{latest}")
+                f"{len(paths)}:{latest}:{int(record['needs_return'])}")
             record["split"] = summary["split"]
             return record
 

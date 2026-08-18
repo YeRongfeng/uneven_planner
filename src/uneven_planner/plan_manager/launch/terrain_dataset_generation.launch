@@ -86,6 +86,7 @@
     <arg name="high_complexity_fraction" default="0.4" doc="高朝向难度轨迹比例"/>
     <arg name="map_ready_delay" default="1.0" doc="发布新地图后开始规划前的非阻塞等待时间（秒）"/>
     <arg name="max_path_retries_before_regenerate" default="30" doc="单条路径连续失败多少次后重新裁剪当前环境；小于等于0表示禁用"/>
+    <arg name="mark_unplannable_canonical" default="false" doc="测试生成：canonical 图试满重试预算仍为 0 条则标打回并跳过"/>
     <arg name="generation_random_seed" default="-1" doc="轨迹/地形随机种子；-1表示非确定性"/>
     
     <!-- 地图文件参数 -->
@@ -236,6 +237,7 @@
         <param name="high_complexity_fraction" value="$(arg high_complexity_fraction)"/>
         <param name="map_ready_delay" value="$(arg map_ready_delay)"/>
         <param name="max_path_retries_before_regenerate" value="$(arg max_path_retries_before_regenerate)"/>
+        <param name="mark_unplannable_canonical" value="$(arg mark_unplannable_canonical)"/>
         <param name="generation_random_seed" value="$(arg generation_random_seed)"/>
         <param name="planner_connection_timeout" value="60.0"/>
         
