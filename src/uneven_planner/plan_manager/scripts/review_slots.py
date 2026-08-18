@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Resolve canonical map slots from the append-only review records."""
 
+import datetime
 import json
 from collections import OrderedDict
 from pathlib import Path
@@ -238,3 +239,95 @@ def filled_records(state):
         if fill_slot(record) is not None or state["slots"][key].get("filled"):
             result.append((key, line_number, record))
     return result
+
+
+def _env_index_from_name(name):
+    text = str(name or "")
+    if text.startswith("env") and text[3:].isdigit():
+        return int(text[3:])
+    return None
+
+
+def return_context_from_needs_return(marker_path):
+    marker_path = Path(marker_path)
+    payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    split = payload.get("split") or marker_path.parent.parent.name
+    map_index = payload.get("env_id", payload.get("map_index"))
+    if not isinstance(map_index, int):
+        map_index = _env_index_from_name(marker_path.parent.name)
+    map_path = payload.get("map_path") or ""
+    metadata = {}
+    if map_path:
+        sidecar = Path(map_path).with_suffix(".json")
+        if sidecar.is_file():
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    manual = metadata.get("manual_review") or {}
+    if not isinstance(map_index, int):
+        map_index = metadata.get("canonical_map_index")
+    if split not in SPLITS or not isinstance(map_index, int) or map_index < 0:
+        raise ValueError(f"cannot resolve slot from {marker_path}")
+    center = metadata.get("source_center_xy")
+    if not isinstance(center, list):
+        center = manual.get("center_xy")
+    yaw = metadata.get("crop_yaw_deg")
+    if yaw is None:
+        yaw = manual.get("yaw_deg", 0.0)
+    return {
+        "split": split,
+        "map_index": int(map_index),
+        "source_id": manual.get("source_id", ""),
+        "source_path": metadata.get("source_file") or manual.get("source_path")
+        or map_path,
+        "previous_center_xy": center,
+        "previous_yaw_deg": float(yaw or 0.0),
+        "size_m": float(manual.get("size_m") or metadata.get("patch_size_m") or 20.0),
+        "scene_id": f"{split}/env{int(map_index):06d}",
+        "display_id": f"{split}/env{int(map_index):06d}",
+        "reason": payload.get("reason") or "test_generation: no_valid_trajectory",
+    }
+
+
+def append_return_record(review_file, context):
+    """Write one return event unless that slot is already pending."""
+    review_file = Path(review_file)
+    slot = (context["split"], int(context["map_index"]))
+    for _, record in reversed(read_jsonl(review_file)):
+        if record.get("decision") == "approve" and fill_slot(record) == slot:
+            break
+        if returned_slot(record) == slot:
+            return record, False
+    record = {
+        "source_id": context.get("source_id", ""),
+        "decision": "return",
+        "split": context["split"],
+        "map_index": int(context["map_index"]),
+        "center_xy": context.get("previous_center_xy"),
+        "size_m": context.get("size_m", 20.0),
+        "yaw_deg": context.get("previous_yaw_deg", 0.0),
+        "source_path": context.get("source_path", ""),
+        "scene_id": context.get("scene_id", ""),
+        "reason": context.get("reason") or f"8765: {context.get('display_id', '')}",
+        "timestamp_utc": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
+    }
+    review_file.parent.mkdir(parents=True, exist_ok=True)
+    with review_file.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record, True
+
+
+def append_returns_for_dataset(dataset_root, review_file):
+    """Turn every env*/needs_return.json into a 8767 pending slot."""
+    dataset_root = Path(dataset_root)
+    written = []
+    reused = []
+    for split in SPLITS:
+        for marker in sorted((dataset_root / split).glob("env*/needs_return.json")):
+            context = return_context_from_needs_return(marker)
+            record, created = append_return_record(review_file, context)
+            (written if created else reused).append({
+                "split": context["split"],
+                "map_index": context["map_index"],
+                "record": record,
+            })
+    return {"written": written, "already_open": reused}

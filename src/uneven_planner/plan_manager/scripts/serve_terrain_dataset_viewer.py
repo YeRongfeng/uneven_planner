@@ -2,7 +2,6 @@
 """Serve the interactive terrain viewer against any live dataset directory."""
 
 import argparse
-import datetime
 import json
 import pickle
 import re
@@ -18,7 +17,7 @@ from make_terrain_dataset_viewer import (
     trajectory_scene_record,
 )
 from terrain_map_quality import evaluate
-from review_slots import fill_slot, read_jsonl, returned_slot
+from review_slots import append_return_record
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
@@ -368,30 +367,10 @@ class ReplacementJobs:
         return {key: value for key, value in job.items() if key != "process"}
 
     def _append_return(self, context):
-        slot = (context["split"], context["map_index"])
-        for _, record in reversed(read_jsonl(self.review_file)):
-            if record.get("decision") == "approve" and fill_slot(record) == slot:
-                break
-            if returned_slot(record) == slot:
-                return record
-
-        record = {
-            "source_id": context.get("source_id", ""),
-            "decision": "return",
-            "split": context["split"],
-            "map_index": context["map_index"],
-            "center_xy": context.get("previous_center_xy"),
-            "size_m": context.get("size_m", 20.0),
-            "yaw_deg": context.get("previous_yaw_deg", 0.0),
-            "source_path": context.get("source_path", ""),
-            "scene_id": context["scene_id"],
-            "reason": f"8765: {context['display_id']}",
-            "timestamp_utc": datetime.datetime.now(
-                datetime.timezone.utc).isoformat(),
-        }
-        self.review_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.review_file.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        record, _created = append_return_record(self.review_file, {
+            **context,
+            "reason": context.get("reason") or f"8765: {context['display_id']}",
+        })
         return record
 
     def start(self, context):
@@ -407,6 +386,17 @@ class ReplacementJobs:
             }
             self.jobs[job_id] = job
             return self.snapshot(job)
+
+    def start_many(self, contexts):
+        results = []
+        with self.lock:
+            for context in contexts:
+                results.append(self.start(context))
+        return {
+            "status": "completed",
+            "count": len(results),
+            "jobs": results,
+        }
 
     def status(self, job_id):
         with self.lock:
@@ -463,7 +453,9 @@ def make_handler(catalog, html, replacement_jobs):
 
         def do_POST(self):
             parsed = urlparse(self.path)
-            if parsed.path not in {"/api/load-root", "/api/replace-scene"}:
+            if parsed.path not in {
+                    "/api/load-root", "/api/replace-scene",
+                    "/api/replace-scenes"}:
                 self.send_json({"error": "not found"}, 404)
                 return
             try:
@@ -475,6 +467,22 @@ def make_handler(catalog, html, replacement_jobs):
                         raise ValueError("path is required")
                     catalog.set_root(path)
                     self.send_json(catalog.index())
+                    return
+                if parsed.path == "/api/replace-scenes":
+                    ids = record.get("ids")
+                    if not isinstance(ids, list) or not ids:
+                        raise ValueError("ids must be a non-empty list")
+                    contexts = [
+                        catalog.replacement_context(
+                            str(scene_id).strip(),
+                            replacement_jobs.canonical_root,
+                            replacement_jobs.final_root,
+                        )
+                        for scene_id in ids if str(scene_id).strip()
+                    ]
+                    if not contexts:
+                        raise ValueError("ids must be a non-empty list")
+                    self.send_json(replacement_jobs.start_many(contexts))
                     return
                 scene_id = str(record.get("id", "")).strip()
                 if not scene_id:

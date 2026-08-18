@@ -12,7 +12,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from review_slots import active_records, filled_records, resolve_slots
+from review_slots import (
+    active_records, append_return_record, append_returns_for_dataset,
+    filled_records, resolve_slots,
+)
 
 
 class ReviewSlotTest(unittest.TestCase):
@@ -73,6 +76,47 @@ class ReviewSlotTest(unittest.TestCase):
         self.assertEqual(
             [key for key, _, _ in active_records(state)],
             [("train", 0)])
+
+    def test_append_return_is_idempotent_until_refilled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            review = Path(directory) / "manual_regions.jsonl"
+            first, created = append_return_record(review, {
+                "split": "val", "map_index": 7, "display_id": "val/env000007",
+            })
+            second, created_again = append_return_record(review, {
+                "split": "val", "map_index": 7, "display_id": "val/env000007",
+            })
+            self.assertTrue(created)
+            self.assertFalse(created_again)
+            self.assertEqual(first["map_index"], 7)
+            self.assertEqual(second["timestamp_utc"], first["timestamp_utc"])
+
+    def test_dataset_needs_return_markers_open_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = root / "val" / "env000003"
+            env.mkdir(parents=True)
+            canonical = root / "canonical" / "val" / "map_003.json"
+            canonical.parent.mkdir(parents=True)
+            canonical.write_text(json.dumps({
+                "source_file": "/maps/a.laz",
+                "source_center_xy": [1.0, 2.0],
+                "crop_yaw_deg": 10.0,
+                "manual_review": {"source_id": "a.laz", "size_m": 20},
+            }) + "\n", encoding="utf-8")
+            (env / "needs_return.json").write_text(json.dumps({
+                "split": "val",
+                "env_id": 3,
+                "map_path": str(canonical.with_suffix(".pcd")),
+                "reason": "no_valid_trajectory",
+            }) + "\n", encoding="utf-8")
+            review = root / "manual_regions.jsonl"
+            result = append_returns_for_dataset(root, review)
+            self.assertEqual(len(result["written"]), 1)
+            state = resolve_slots(review)
+            self.assertEqual(
+                [slot["key"] for slot in state["open_slots"]],
+                ["val/map_003"])
 
 
 if __name__ == "__main__":

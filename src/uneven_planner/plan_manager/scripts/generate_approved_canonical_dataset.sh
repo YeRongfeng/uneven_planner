@@ -369,4 +369,28 @@ else
 fi
 
 trap - EXIT INT TERM
+if [[ "${test_generation}" == "1" ]]; then
+    review_file="$(python3 - "${manifest}" <<'PY'
+import json
+import sys
+from pathlib import Path
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(manifest.get("review_file") or "")
+PY
+)"
+    if [[ -n "${review_file}" ]]; then
+        python3 - "${output_dir}" "${review_file}" "${script_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from review_slots import append_returns_for_dataset
+result = append_returns_for_dataset(sys.argv[1], sys.argv[2])
+print(json.dumps({
+    "auto_returned": len(result["written"]),
+    "already_open": len(result["already_open"]),
+}, ensure_ascii=False), file=sys.stderr)
+PY
+    fi
+fi
 echo "Completed approved canonical dataset: ${output_dir}" >&2
