@@ -118,6 +118,33 @@ class ReviewSlotTest(unittest.TestCase):
                 [slot["key"] for slot in state["open_slots"]],
                 ["val/map_003"])
 
+    def test_stale_needs_return_does_not_reopen_a_filled_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            review = root / "manual_regions.jsonl"
+            review.write_text(
+                json.dumps({
+                    "source_id": "a.laz", "decision": "approve", "split": "val",
+                    "fills_slot": {"split": "val", "map_index": 3},
+                    "timestamp_utc": "2026-08-18T14:07:00+00:00",
+                }) + "\n",
+                encoding="utf-8")
+            env = root / "val" / "env000003"
+            env.mkdir(parents=True)
+            marker = env / "needs_return.json"
+            marker.write_text(json.dumps({
+                "split": "val", "env_id": 3, "reason": "no_valid_trajectory",
+            }) + "\n", encoding="utf-8")
+            import os
+            os.utime(marker, (1_000_000_000, 1_000_000_000))
+            result = append_returns_for_dataset(root, review)
+            self.assertEqual(result["written"], [])
+            state = resolve_slots(review)
+            self.assertEqual(state["open_slots"], [])
+            self.assertEqual(
+                [key for key, _, _ in filled_records(state)],
+                [("val", 3)])
+
 
 if __name__ == "__main__":
     unittest.main()

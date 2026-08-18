@@ -2918,7 +2918,19 @@ class TerrainDatasetGenerator:
         os.makedirs(env_dir, exist_ok=True)
         import glob
         self._env_skip_status = None
-        if self.external_map_is_canonical:
+        if self.external_map_is_canonical and self.mark_unplannable_canonical:
+            # Unchecked test generation must re-try the current canonical
+            # map. Old 打回 markers and the previous 1 path belong to the
+            # last test, not this map version.
+            self.clear_canonical_needs_return(env_dir)
+            for path_file in glob.glob(os.path.join(env_dir, "path_*.p")):
+                try:
+                    os.remove(path_file)
+                except OSError:
+                    pass
+            self.current_path_id = 0
+            self.paths_generated_for_current_env = 0
+        elif self.external_map_is_canonical:
             skip_status = self.canonical_env_skip_status(env_dir)
             if skip_status:
                 self._env_skip_status = skip_status

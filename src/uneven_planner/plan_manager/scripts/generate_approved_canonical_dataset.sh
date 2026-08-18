@@ -140,6 +140,33 @@ count_skip_markers() {
     find "${root}" -mindepth 2 -maxdepth 2 -type f -name needs_return.json | wc -l
 }
 
+reset_test_env() {
+    local dir="$1"
+    if [[ ! -d "${dir}" ]]; then
+        return 0
+    fi
+    rm -f "${dir}/needs_return.json"
+    find "${dir}" -maxdepth 1 -type f -name 'path_*.p' -delete
+}
+
+reset_test_range() {
+    local start_env="$1"
+    local env_count="$2"
+    local want_train="$3"
+    local want_val="$4"
+    local index env_id name
+    for ((index = 0; index < env_count; index++)); do
+        env_id=$((start_env + index))
+        printf -v name 'env%06d' "${env_id}"
+        if [[ "${want_train}" == "1" ]]; then
+            reset_test_env "${output_dir}/train/${name}"
+        fi
+        if [[ "${want_val}" == "1" ]]; then
+            reset_test_env "${output_dir}/val/${name}"
+        fi
+    done
+}
+
 worker_failed() {
     rg -q '"status"[[:space:]]*:[[:space:]]*"failed"' \
         "${output_dir}"/experiment_manifest_worker_*.json 2>/dev/null
@@ -209,6 +236,11 @@ run_launch() {
         want_train="0"
     fi
 
+    if [[ "${test_generation}" == "1" ]]; then
+        echo "Test generation: clearing previous 1-path results and 打回 markers in this range" >&2
+        reset_test_range "${start_env}" "${environments}" "${want_train}" "${want_val}"
+    fi
+
     echo "Starting ${phase}: environments=${environments}, start_env=${start_env}, start_phase=${start_phase}" >&2
     setsid env ROS_MASTER_URI="http://localhost:${ros_port}" \
         ROS_LOG_DIR="${log_dir}/ros_${phase}" \
@@ -273,6 +305,30 @@ run_launch() {
     done
 }
 
+append_test_returns() {
+    if [[ "${test_generation}" != "1" ]]; then
+        return 0
+    fi
+    python3 - "${manifest}" "${output_dir}" "${script_dir}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[3])
+from review_slots import append_returns_for_dataset
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+review = manifest.get("review_file") or ""
+if not review:
+    raise SystemExit(0)
+result = append_returns_for_dataset(sys.argv[2], review)
+print(json.dumps({
+    "auto_returned": len(result["written"]),
+    "already_open": len(result["already_open"]),
+}, ensure_ascii=False), file=sys.stderr)
+PY
+}
+
 nth_csv() {
     local csv="$1"
     local index="$2"
@@ -314,7 +370,7 @@ PY
     filled_train="${filled_values[0]}"
     filled_val="${filled_values[1]}"
     if [[ -z "${filled_train}" && -z "${filled_val}" ]]; then
-        echo "没有已补位的地图可生成最终轨迹" >&2
+        echo "没有已补位的地图可测试或生成轨迹" >&2
         exit 1
     fi
     declare -A do_train=()
@@ -369,28 +425,5 @@ else
 fi
 
 trap - EXIT INT TERM
-if [[ "${test_generation}" == "1" ]]; then
-    review_file="$(python3 - "${manifest}" <<'PY'
-import json
-import sys
-from pathlib import Path
-manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(manifest.get("review_file") or "")
-PY
-)"
-    if [[ -n "${review_file}" ]]; then
-        python3 - "${output_dir}" "${review_file}" "${script_dir}" <<'PY'
-import json
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[3])
-from review_slots import append_returns_for_dataset
-result = append_returns_for_dataset(sys.argv[1], sys.argv[2])
-print(json.dumps({
-    "auto_returned": len(result["written"]),
-    "already_open": len(result["already_open"]),
-}, ensure_ascii=False), file=sys.stderr)
-PY
-    fi
-fi
+append_test_returns
 echo "Completed approved canonical dataset: ${output_dir}" >&2

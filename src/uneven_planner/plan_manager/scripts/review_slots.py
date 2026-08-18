@@ -284,18 +284,43 @@ def return_context_from_needs_return(marker_path):
         "scene_id": f"{split}/env{int(map_index):06d}",
         "display_id": f"{split}/env{int(map_index):06d}",
         "reason": payload.get("reason") or "test_generation: no_valid_trajectory",
+        "marker_mtime": marker_path.stat().st_mtime,
     }
 
 
+def _event_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 def append_return_record(review_file, context):
-    """Write one return event unless that slot is already pending."""
+    """Write one return event unless that slot is already pending.
+
+    A leftover needs_return.json from before a human fill must not reopen
+    the slot. A marker newer than the fill means this map version failed.
+    """
     review_file = Path(review_file)
     slot = (context["split"], int(context["map_index"]))
+    latest_fill = None
     for _, record in reversed(read_jsonl(review_file)):
         if record.get("decision") == "approve" and fill_slot(record) == slot:
+            latest_fill = record
             break
         if returned_slot(record) == slot:
             return record, False
+    if latest_fill is not None:
+        marker_mtime = _event_timestamp(context.get("marker_mtime"))
+        fill_time = _event_timestamp(latest_fill.get("timestamp_utc"))
+        if (marker_mtime is not None and fill_time is not None
+                and marker_mtime <= fill_time):
+            return latest_fill, False
     record = {
         "source_id": context.get("source_id", ""),
         "decision": "return",
