@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Original-sim max-z fit at our 20 m / 0.1 m cell size."""
+"""Original-sim max-z fit stored as the 20 m / 0.2 m coarse grid."""
 
 import sys
 import unittest
@@ -19,8 +19,8 @@ from prepare_laz_terrain_map import (
 
 class SimHorizontalParamsTest(unittest.TestCase):
     def test_internals_are_half_of_40m_sim(self):
+        self.assertEqual(sim_horizontal_params(0.2), (0.1, 0.2))
         self.assertEqual(sim_horizontal_params(0.1), (0.1, 0.2))
-        self.assertEqual(sim_horizontal_params(0.05), (0.1, 0.2))
 
 
 class SimElevationFitTest(unittest.TestCase):
@@ -30,9 +30,9 @@ class SimElevationFitTest(unittest.TestCase):
         xyz = np.column_stack((
             xx.ravel(), yy.ravel(), np.full(xx.size, 10.0)))
         _, _, elevation, _, valid, _, _, diagnostics = fit_sim_elevation_grid(
-            xyz, 20.0, 0.1)
+            xyz, 20.0, 0.2)
         self.assertTrue(valid.all())
-        self.assertEqual(elevation.shape, (200, 200))
+        self.assertEqual(elevation.shape, (100, 100))
         self.assertAlmostEqual(diagnostics["voxel_size_m"], 0.1)
         self.assertAlmostEqual(diagnostics["coarse_resolution_m"], 0.2)
         self.assertEqual(diagnostics["fit_method"], "sim_cell_max_z")
@@ -50,10 +50,10 @@ class SimElevationFitTest(unittest.TestCase):
             tree_x.ravel(), tree_y.ravel(), np.full(tree_x.size, 11.5)))
         xyz = np.vstack((ground, tree))
         local_x, local_y, elevation, _, _, _, _, diagnostics = (
-            fit_sim_elevation_grid(xyz, 20.0, 0.1))
+            fit_sim_elevation_grid(xyz, 20.0, 0.2))
         tree_cells = (
-            (np.abs(local_x - 1.0) <= 0.15)
-            & (np.abs(local_y - 1.0) <= 0.15))
+            (np.abs(local_x - 1.0) <= 0.2)
+            & (np.abs(local_y - 1.0) <= 0.2))
         self.assertGreater(int(np.count_nonzero(tree_cells)), 0)
         self.assertGreater(float(np.max(elevation[tree_cells])), 11.2)
         self.assertLess(float(np.min(elevation)), 10.1)
@@ -70,7 +70,7 @@ class SimElevationFitTest(unittest.TestCase):
         ])
         xyz = np.vstack((ground, flyers))
         _, _, elevation, _, _, _, _, diagnostics = fit_sim_elevation_grid(
-            xyz, 20.0, 0.1)
+            xyz, 20.0, 0.2)
         self.assertEqual(diagnostics["low_flyer_removed"], 3)
         self.assertLess(float(np.max(np.abs(elevation - 10.0))), 0.05)
 

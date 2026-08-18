@@ -31,11 +31,12 @@ from scipy.spatial import cKDTree
 
 
 # Original 40 m sim in grid_transformer.cpp: voxel 0.2, coarse 0.4,
-# output 0.2 → 200 x 200 cells. 20 m maps keep that network size, so
-# every spacing is halved. The 0.05 m planner PCD is sampled afterwards.
+# cubic to 0.2. 20 m maps keep the coarse cell: voxel 0.1, coarse 0.2,
+# and store that 0.2 m / 100 x 100 grid. No upsample. The 0.05 m
+# planner PCD is sampled afterwards.
 SIM_DEFAULT_VOXEL_SIZE = 0.1
 SIM_DEFAULT_COARSE_RESOLUTION = 0.2
-SIM_DEFAULT_OUTPUT_RESOLUTION = 0.1
+SIM_DEFAULT_OUTPUT_RESOLUTION = 0.2
 YRF_DEFAULT_VOXEL_SIZE = SIM_DEFAULT_VOXEL_SIZE
 YRF_DEFAULT_COARSE_RESOLUTION = SIM_DEFAULT_COARSE_RESOLUTION
 YRF_DEFAULT_GROUND_BAND_BELOW = 0.25
@@ -53,8 +54,7 @@ YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE = 7
 def sim_horizontal_params(resolution=None):
     """Voxel and coarse spacings for the original sim, scaled to 20 m.
 
-    ``resolution`` is the output grid and does not change the 0.1 / 0.2
-    internals.
+    ``resolution`` is the stored grid. Voxel / coarse stay 0.1 / 0.2.
     """
     del resolution
     return SIM_DEFAULT_VOXEL_SIZE, SIM_DEFAULT_COARSE_RESOLUTION
@@ -597,11 +597,10 @@ def fit_sim_elevation_grid(
         low_flyer_below=YRF_DEFAULT_LOW_FLYER_BELOW):
     """Original ``grid_transformer.cpp`` elevation, scaled for 20 m maps.
 
-    VoxelGrid centroids, per coarse cell maximum z, cubic to the output
-    grid. The 40 m simulator used 0.2 / 0.4 / 0.2 m; 20 m maps use
-    0.1 / 0.2 / 0.1 m so the network still sees 200 x 200 cells. Empty
-    coarse cells are NaN in the simulator and completed here so the
-    sidecar is full. LAS class is not used.
+    VoxelGrid centroids, per coarse cell maximum z. 20 m maps store the
+    0.2 m coarse grid (100 x 100), not a cubic upsample. Empty coarse
+    cells are NaN in the simulator and completed here so the sidecar is
+    full. LAS class is not used.
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3 or not len(xyz):

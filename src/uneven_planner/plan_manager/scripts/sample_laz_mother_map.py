@@ -3,12 +3,11 @@
 
 The source is loaded once, but no fixed crop list is required. Candidate
 centres and yaw angles are sampled deterministically from raw source support.
-The continuous 200 x 200 grid is fitted with the original simulator
-max-z path at this map's cell size (0.1 m on 20 m maps). The retained
-planner PCD contains that fitted surface together with all finite raw XYZ
-returns in the crop. LAS class is not used. Only quality-passing scenes
-are retained; every attempted location and rejection reason is recorded
-in a manifest.
+The continuous 100 x 100 grid is the original-simulator coarse max-z
+surface (0.2 m on 20 m maps). The retained planner PCD contains that
+fitted surface together with all finite raw XYZ returns in the crop.
+LAS class is not used. Only quality-passing scenes are retained; every
+attempted location and rejection reason is recorded in a manifest.
 """
 
 import argparse
@@ -321,8 +320,8 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
             "ground_fit_support": (
                 "sim voxel centroids + coarse-cell maximum z"),
             "fit": (
-                "original sim 0.1m voxel / 0.2m coarse max-z, "
-                "cubic to this map's 0.1m grid"),
+                "original sim 0.1m voxel / 0.2m coarse max-z stored as "
+                "this map's 0.2m / 100x100 grid"),
             "yrf_voxel_size_m": diagnostics.get(
                 "voxel_size_m", getattr(args, "yrf_voxel_size", None)),
             "yrf_coarse_resolution_m": diagnostics.get(

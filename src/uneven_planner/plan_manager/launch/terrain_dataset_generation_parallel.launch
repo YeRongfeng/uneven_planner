@@ -58,7 +58,7 @@
     <arg name="canonical_primary_scene_count" default="-1"/>
     <arg name="canonical_pool_start_env_id" default="-1"/>
     <arg name="target_map_size" default="20.0"/>
-    <arg name="target_resolution" default="0.1"/>
+    <arg name="target_resolution" default="0.2"/>
     <arg name="external_map_physical_size" default="0.0"/>
     <arg name="external_map_min_physical_size" default="26.0"/>
     <arg name="scale_external_map_z" default="false"/>
@@ -72,7 +72,7 @@
     <arg name="crop_random_seed" default="-1"/>
 
     <arg name="coarse_resolution" default="0.2"/>
-    <arg name="fine_resolution" default="0.1"/>
+    <arg name="fine_resolution" default="0.2"/>
     <arg name="voxel_size" default="0.1"/>
     <arg name="min_distance" default="5.0"/>
     <arg name="publish_delay" default="0.1"/>

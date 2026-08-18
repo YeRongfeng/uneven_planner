@@ -305,7 +305,7 @@ def run_final_generation(args, canonical_path, domain):
         "canonical_primary_scene_count": "1",
         "canonical_pool_start_env_id": str(args.environment_id),
         "target_map_size": "20.0",
-        "target_resolution": "0.1",
+        "target_resolution": "0.2",
         "external_map_physical_size": "0.0",
         "external_map_min_physical_size": "0.0",
         "scale_external_map_z": "false",

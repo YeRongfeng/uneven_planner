@@ -1029,13 +1029,13 @@ class GridTransformer:
     调用pointcloud_to_grid_converter节点提供的服务
     """
 
-    def __init__(self, coarse_resolution=0.2, fine_resolution=0.1, voxel_size=0.1):
+    def __init__(self, coarse_resolution=0.2, fine_resolution=0.2, voxel_size=0.1):
         """
         初始化GridTransformer
         
         Args:
             coarse_resolution: 点云聚合分辨率（0.2m）
-            fine_resolution: 精细网格分辨率（0.1m）
+            fine_resolution: 输出栅格分辨率（0.2m，与粗格相同）
             voxel_size: 体素降采样大小（0.1m）
         """
         self.coarse_resolution = coarse_resolution
@@ -1643,7 +1643,7 @@ class TerrainDatasetGenerator:
                         f"{split_name} canonical pool has {len(split_paths)} "
                         f"maps; expected at least {expected_pool_size}")
         self.target_map_size = float(rospy.get_param('~target_map_size', 20.0))
-        self.target_resolution = float(rospy.get_param('~target_resolution', 0.1))
+        self.target_resolution = float(rospy.get_param('~target_resolution', 0.2))
         self.external_map_fixed_yaw_deg = float(
             rospy.get_param('~external_map_fixed_yaw_deg', 180.0))
         self.external_map_physical_size = float(
@@ -1724,7 +1724,7 @@ class TerrainDatasetGenerator:
         
         # 地图转换参数（完全匹配grid_transformer.cpp）
         self.coarse_resolution = rospy.get_param('~coarse_resolution', 0.2)
-        self.fine_resolution = rospy.get_param('~fine_resolution', 0.1)
+        self.fine_resolution = rospy.get_param('~fine_resolution', 0.2)
         self.voxel_size = rospy.get_param('~voxel_size', 0.1)
         
         # 路径生成参数（动态计算，在地图生成后更新）
@@ -3053,7 +3053,7 @@ class TerrainDatasetGenerator:
                 grid_map_data = self.grid_transformer.transform_pointcloud_to_grid(
                     grid_input_pcd, map_bounds)
 
-            # 不再通过 resize 隐式改变物理分辨率；服务必须直接输出200x200。
+            # 不再通过 resize 隐式改变物理分辨率；服务必须直接输出100x100。
             expected_grid_size = int(round(
                 self.target_map_size / self.target_resolution))
             actual_grid_shape = grid_map_data['elevation'].shape

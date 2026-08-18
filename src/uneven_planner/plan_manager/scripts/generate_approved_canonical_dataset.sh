@@ -228,7 +228,7 @@ run_launch() {
         external_map_is_canonical:=true \
         canonical_maps_per_environment:=1 \
         target_map_size:=20.0 \
-        target_resolution:=0.1 \
+        target_resolution:=0.2 \
         external_map_physical_size:=0.0 \
         external_map_min_physical_size:=0.0 \
         scale_external_map_z:=false \

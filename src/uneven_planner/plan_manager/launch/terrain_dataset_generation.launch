@@ -57,7 +57,7 @@
     <arg name="canonical_primary_scene_count" default="-1" doc="canonical池每轮跨度；负数使用本进程环境数"/>
     <arg name="canonical_pool_start_env_id" default="-1" doc="canonical池对应的全局起始环境ID；负数使用本进程start_env_id"/>
     <arg name="target_map_size" default="20.0" doc="旋转裁剪后的目标地图尺寸（米）"/>
-    <arg name="target_resolution" default="0.1" doc="目标栅格分辨率（米），20/0.1=200"/>
+    <arg name="target_resolution" default="0.2" doc="目标栅格分辨率（米），20/0.2=100"/>
     <arg name="external_map_physical_size" default="0.0" doc="原始点云横向物理尺寸（米）；0表示源坐标已经是米，不缩放"/>
     <arg name="external_map_min_physical_size" default="0.0" doc="仅将过小源地图的较短边放大到该尺寸；0表示禁用，内置多地图池使用26.0"/>
     <arg name="scale_external_map_z" default="false" doc="缩放XY时是否同时缩放高度；米制地图应为false"/>
@@ -71,8 +71,8 @@
     <arg name="crop_random_seed" default="-1" doc="随机裁剪种子；-1表示每次随机"/>
     
     <!-- 地图转换参数 -->
-    <arg name="coarse_resolution" default="0.2" doc="点云聚合栅格分辨率（米），原仿真 0.4 m 在 20 m 图上减半"/>
-    <arg name="fine_resolution" default="0.1" doc="最终输出栅格分辨率（米）"/>
+    <arg name="coarse_resolution" default="0.2" doc="点云聚合栅格分辨率（米），也是写出的 100x100 网格"/>
+    <arg name="fine_resolution" default="0.2" doc="最终输出栅格分辨率（米），与粗格相同"/>
     <arg name="voxel_size" default="0.1" doc="体素降采样大小（米）"/>
     
     <!-- 路径生成参数 -->
