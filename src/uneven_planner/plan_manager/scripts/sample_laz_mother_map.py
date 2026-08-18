@@ -3,11 +3,12 @@
 
 The source is loaded once, but no fixed crop list is required. Candidate
 centres and yaw angles are sampled deterministically from raw source support.
-The continuous 100 x 100 grid is fitted with the YRF elevation-generator
-path at this map's cell size. The retained planner PCD contains that fitted
-surface together with all finite raw XYZ returns in the crop. LAS class is
-not used. Only quality-passing scenes are retained; every attempted location
-and rejection reason is recorded in a manifest.
+The continuous 200 x 200 grid is fitted with the original simulator
+max-z path at this map's cell size (0.1 m on 20 m maps). The retained
+planner PCD contains that fitted surface together with all finite raw XYZ
+returns in the crop. LAS class is not used. Only quality-passing scenes
+are retained; every attempted location and rejection reason is recorded
+in a manifest.
 """
 
 import argparse
@@ -21,8 +22,9 @@ import sys
 import laspy
 import numpy as np
 from prepare_laz_terrain_map import (
+    SIM_DEFAULT_OUTPUT_RESOLUTION,
     fit_grid,
-    fit_yrf_ground_grid,
+    fit_sim_elevation_grid,
     geometry_ground_candidates,
     measure_above_surface_coverage,
     measure_classified_above_surface_coverage,
@@ -56,7 +58,7 @@ def parse_args():
         "--resume", action="store_true",
         help="Continue an existing sampling manifest in output_dir")
     parser.add_argument("--size", type=float, default=20.0)
-    parser.add_argument("--resolution", type=float, default=0.2)
+    parser.add_argument("--resolution", type=float, default=SIM_DEFAULT_OUTPUT_RESOLUTION)
     parser.add_argument("--planner-surface-resolution", type=float, default=0.05,
                         help="Dense fitted-surface spacing used by UnevenMap")
     parser.add_argument("--raw-below-surface-tolerance", type=float, default=1.0,
@@ -216,18 +218,16 @@ def grid_coverage(points, size, resolution):
 
 def build_surface(exact, padded, args):
     fit_method = getattr(args, "fit_method", "local_plane")
-    if fit_method == "yrf_ground":
+    if fit_method in ("yrf_ground", "sim_elevation"):
         (local_x, local_y, elevation, normals, valid, observed, neighbors,
-         split_diagnostics) = fit_yrf_ground_grid(
+         split_diagnostics) = fit_sim_elevation_grid(
             padded,
             args.size,
             args.resolution,
             coarse_resolution=getattr(args, "yrf_coarse_resolution", None),
             voxel_size=getattr(args, "yrf_voxel_size", None),
-            ground_below=args.ground_band_below,
-            ground_above=args.ground_band_above,
         )
-        ground_candidate_count = split_diagnostics["ground_candidate_count"]
+        ground_candidate_count = split_diagnostics["fit_point_count"]
     else:
         ground_points, _, _, split_diagnostics = geometry_ground_candidates(
             padded,
@@ -315,13 +315,14 @@ def metadata_for(surface, exact_count, support_coverage, center, yaw,
         "z_output": "source elevation minus retained patch minimum",
         "planner_pcd": "dense completed fitted surface plus supported raw XYZ returns",
     }
-    if fit_method == "yrf_ground":
+    if fit_method in ("yrf_ground", "sim_elevation"):
         diagnostics = surface.get("split_diagnostics") or {}
         processing.update({
             "ground_fit_support": (
-                "YRF voxel centroids + cell min-z + 3x3 upper-median "
-                "reference + ground-band median"),
-            "fit": "YRF 0.2m voxel / 0.4m coarse, cubic to this map's 0.2m grid",
+                "sim voxel centroids + coarse-cell maximum z"),
+            "fit": (
+                "original sim 0.1m voxel / 0.2m coarse max-z, "
+                "cubic to this map's 0.1m grid"),
             "yrf_voxel_size_m": diagnostics.get(
                 "voxel_size_m", getattr(args, "yrf_voxel_size", None)),
             "yrf_coarse_resolution_m": diagnostics.get(

@@ -27,12 +27,13 @@ from sample_laz_mother_map import (
     select_local_points,
 )
 from prepare_laz_terrain_map import (
-    YRF_DEFAULT_COARSE_RESOLUTION,
+    SIM_DEFAULT_COARSE_RESOLUTION,
+    SIM_DEFAULT_OUTPUT_RESOLUTION,
+    SIM_DEFAULT_VOXEL_SIZE,
     YRF_DEFAULT_ENVELOPE_OUTLIER,
     YRF_DEFAULT_GROUND_BAND_ABOVE,
     YRF_DEFAULT_GROUND_BAND_BELOW,
     YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE,
-    YRF_DEFAULT_VOXEL_SIZE,
     write_binary_pcd,
 )
 from terrain_map_quality import evaluate
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument("--val-source-profile", default="als",
                         choices=("als", "uls"))
     parser.add_argument("--size", type=float, default=20.0)
-    parser.add_argument("--resolution", type=float, default=0.2)
+    parser.add_argument("--resolution", type=float, default=SIM_DEFAULT_OUTPUT_RESOLUTION)
     parser.add_argument("--fit-radius", type=float, default=0.9)
     parser.add_argument("--surface-cell-size", type=float, default=1.0)
     parser.add_argument("--ground-band-below", type=float,
@@ -72,9 +73,9 @@ def parse_args():
     parser.add_argument("--raw-above-surface-tolerance", type=float, default=50.0)
     parser.add_argument("--coverage-resolution", type=float, default=1.0)
     parser.add_argument("--yrf-coarse-resolution", type=float,
-                        default=YRF_DEFAULT_COARSE_RESOLUTION)
+                        default=SIM_DEFAULT_COARSE_RESOLUTION)
     parser.add_argument("--yrf-voxel-size", type=float,
-                        default=YRF_DEFAULT_VOXEL_SIZE)
+                        default=SIM_DEFAULT_VOXEL_SIZE)
     parser.add_argument("--yrf-lower-envelope-filter-size", type=int,
                         default=YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE)
     parser.add_argument(
@@ -110,7 +111,7 @@ def processing_args(source_path, cli, site_id, source_profile):
         raw_below_surface_tolerance=cli.raw_below_surface_tolerance,
         raw_above_surface_tolerance=cli.raw_above_surface_tolerance,
         coverage_resolution=cli.coverage_resolution,
-        fit_method="yrf_ground",
+        fit_method="sim_elevation",
         yrf_coarse_resolution=cli.yrf_coarse_resolution,
         yrf_voxel_size=cli.yrf_voxel_size,
         yrf_lower_envelope_filter_size=cli.yrf_lower_envelope_filter_size,
@@ -375,7 +376,7 @@ def main():
             "raw_below_surface_tolerance_m": cli.raw_below_surface_tolerance,
             "raw_above_surface_tolerance_m": cli.raw_above_surface_tolerance,
             "coverage_resolution_m": cli.coverage_resolution,
-            "fit_method": "yrf_ground_reference",
+            "fit_method": "sim_cell_max_z",
             "yrf_coarse_resolution_m": cli.yrf_coarse_resolution,
             "yrf_voxel_size_m": cli.yrf_voxel_size,
             "yrf_lower_envelope_filter_size": (

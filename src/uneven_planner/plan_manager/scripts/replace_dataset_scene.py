@@ -16,12 +16,13 @@ from types import SimpleNamespace
 import numpy as np
 
 from prepare_laz_terrain_map import (
-    YRF_DEFAULT_COARSE_RESOLUTION,
+    SIM_DEFAULT_COARSE_RESOLUTION,
+    SIM_DEFAULT_OUTPUT_RESOLUTION,
+    SIM_DEFAULT_VOXEL_SIZE,
     YRF_DEFAULT_ENVELOPE_OUTLIER,
     YRF_DEFAULT_GROUND_BAND_ABOVE,
     YRF_DEFAULT_GROUND_BAND_BELOW,
     YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE,
-    YRF_DEFAULT_VOXEL_SIZE,
     write_binary_pcd,
 )
 from sample_laz_mother_map import (
@@ -79,7 +80,7 @@ def build_processing_args(metadata, source_path, domain, split):
         crs=metadata.get("source_crs", ""),
         source_profile=profile,
         size=float(metadata.get("patch_size_m", 20.0)),
-        resolution=float(metadata.get("resolution_m", 0.2)),
+        resolution=SIM_DEFAULT_OUTPUT_RESOLUTION,
         fit_radius=float(value_from(
             metadata, processing, "fit_radius_m", defaults["fit_radius"])),
         surface_cell_size=float(value_from(
@@ -106,12 +107,9 @@ def build_processing_args(metadata, source_path, domain, split):
         coverage_resolution=float(value_from(
             metadata, processing, "center_sampling_resolution_m",
             defaults["coverage_resolution"])),
-        fit_method="yrf_ground",
-        yrf_coarse_resolution=float(value_from(
-            metadata, processing, "yrf_coarse_resolution_m",
-            YRF_DEFAULT_COARSE_RESOLUTION)),
-        yrf_voxel_size=float(value_from(
-            metadata, processing, "yrf_voxel_size_m", YRF_DEFAULT_VOXEL_SIZE)),
+        fit_method="sim_elevation",
+        yrf_coarse_resolution=SIM_DEFAULT_COARSE_RESOLUTION,
+        yrf_voxel_size=SIM_DEFAULT_VOXEL_SIZE,
         yrf_lower_envelope_filter_size=int(value_from(
             metadata, processing, "yrf_lower_envelope_filter_size",
             YRF_DEFAULT_LOWER_ENVELOPE_FILTER_SIZE)),
@@ -307,7 +305,7 @@ def run_final_generation(args, canonical_path, domain):
         "canonical_primary_scene_count": "1",
         "canonical_pool_start_env_id": str(args.environment_id),
         "target_map_size": "20.0",
-        "target_resolution": "0.2",
+        "target_resolution": "0.1",
         "external_map_physical_size": "0.0",
         "external_map_min_physical_size": "0.0",
         "scale_external_map_z": "false",

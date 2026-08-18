@@ -396,12 +396,11 @@ class SourceData:
         return exact, padded
 
     def fit(self, center_x, center_y, size, yaw_deg):
-        """Fit the same YRF ground surface used by canonical generation."""
+        """Fit the same sim max-z surface used by canonical generation."""
         from prepare_laz_terrain_map import (
-            YRF_DEFAULT_GROUND_BAND_ABOVE,
-            YRF_DEFAULT_GROUND_BAND_BELOW,
-            fit_yrf_ground_grid,
-            yrf_horizontal_params,
+            SIM_DEFAULT_OUTPUT_RESOLUTION,
+            fit_sim_elevation_grid,
+            sim_horizontal_params,
         )
         from sample_laz_mother_map import grid_coverage
 
@@ -412,17 +411,15 @@ class SourceData:
         if len(exact) == 0 or len(padded) == 0:
             raise ValueError("candidate contains no points for fitting")
 
-        resolution = 0.20
-        voxel_size, coarse_resolution = yrf_horizontal_params(resolution)
+        resolution = SIM_DEFAULT_OUTPUT_RESOLUTION
+        voxel_size, coarse_resolution = sim_horizontal_params(resolution)
         (local_x, local_y, elevation, normals, valid, observed, neighbors,
-         split_diagnostics) = fit_yrf_ground_grid(
+         split_diagnostics) = fit_sim_elevation_grid(
             padded,
             size,
             resolution,
             coarse_resolution=coarse_resolution,
             voxel_size=voxel_size,
-            ground_below=YRF_DEFAULT_GROUND_BAND_BELOW,
-            ground_above=YRF_DEFAULT_GROUND_BAND_ABOVE,
         )
         valid = np.asarray(valid, dtype=bool)
         elevation = np.asarray(elevation, dtype=np.float64)
@@ -448,25 +445,23 @@ class SourceData:
             "size_m": float(size),
             "yaw_deg": float(yaw_deg),
             "method": (
-                "YRF elevation-generator fit on a 20 m crop: "
+                "original sim fit on a 20 m crop: "
                 f"{voxel_size:.2f}m voxel centroids, "
-                f"{coarse_resolution:.2f}m cell min-z, "
-                f"3x3 upper-median reference, cubic to {resolution:.2f}m"),
+                f"{coarse_resolution:.2f}m cell max-z, "
+                f"cubic to {resolution:.2f}m"),
             "vertical_origin_m": vertical_origin,
             "stats": {
                 "raw_points_in_candidate": int(len(exact)),
                 "raw_points_in_fit_margin": int(len(padded)),
                 "fit_point_scope": split_diagnostics["fit_point_scope"],
-                "fit_points": int(split_diagnostics["ground_candidate_count"]),
+                "fit_points": int(split_diagnostics["fit_point_count"]),
                 "fit_point_fraction": float(
-                    split_diagnostics["ground_candidate_count"] / len(padded)),
+                    split_diagnostics["fit_point_count"] / len(padded)),
                 "classification_policy": (
-                    "all finite XYZ; LAS class not used"),
+                    "all finite XYZ; LAS class not used; cell max-z"),
                 "surface_cell_size_m": coarse_resolution,
                 "voxel_size_m": voxel_size,
                 "coarse_resolution_m": coarse_resolution,
-                "ground_band_below_m": YRF_DEFAULT_GROUND_BAND_BELOW,
-                "ground_band_above_m": YRF_DEFAULT_GROUND_BAND_ABOVE,
                 "low_flyer_removed": int(
                     split_diagnostics.get("low_flyer_removed", 0)),
                 "low_flyer_below_m": float(
@@ -1306,7 +1301,7 @@ function threeColor(i,data,mode,source,crop,baseZ,zMin,zMax){const actual=mode==
 function addRawThreePoints(view,data,source,crop,selection,baseZ,verticalScale){const count=data.count;if(!count)return;let zMin=Infinity,zMax=-Infinity;for(let i=0;i<count;i++){const z=data.z[i]+crop.origin_z;zMin=Math.min(zMin,z);zMax=Math.max(zMax,z)}const a=selection.yaw_deg*Math.PI/180,ca=Math.cos(a),sa=Math.sin(a),positions=new Float32Array(count*3),colors=new Float32Array(count*3);for(let i=0;i<count;i++){const gx=crop.origin_xy[0]+data.x[i],gy=crop.origin_xy[1]+data.y[i],dx=gx-selection.center_xy[0],dy=gy-selection.center_xy[1],lx=ca*dx+sa*dy,ly=-sa*dx+ca*dy;positions[i*3]=lx;positions[i*3+1]=(data.z[i]+crop.origin_z-baseZ)*verticalScale;positions[i*3+2]=ly;threeColor(i,data,$('colorMode').value,source,crop,baseZ,zMin,zMax).toArray(colors,i*3)}const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.BufferAttribute(colors,3));const material=new THREE.PointsMaterial({size:Math.max(.06,selection.size_m*.008),sizeAttenuation:true,vertexColors:true,transparent:true,opacity:.9});view.group.add(new THREE.Points(geometry,material));return {zMin,zMax}}
 function addFitThreePoints(view,fit,verticalScale){const grid=fit.grid,x=typed(grid.x,'f4'),y=typed(grid.y,'f4'),z=typed(grid.z,'f4'),valid=typed(grid.valid,'u8'),positions=[],colors=[],range=fit.stats.elevation_range_m;for(let i=0;i<valid.length;i++){if(!valid[i])continue;positions.push(x[i],z[i]*verticalScale,y[i]);const t=Math.max(0,Math.min(1,(z[i]-range[0])/(range[1]-range[0]||1)));const c=new THREE.Color().setHSL(.52-.42*t,.82,.55);colors.push(c.r,c.g,c.b)}const geometry=new THREE.BufferGeometry();geometry.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));geometry.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));const material=new THREE.PointsMaterial({size:.07,sizeAttenuation:true,vertexColors:true,transparent:true,opacity:.78});view.group.add(new THREE.Points(geometry,material))}
 function renderCrop3d(){const wrap=$('crop3dWrap'),empty=wrap.querySelector('.empty');if(!state.crop){$('crop3d').hidden=true;$('threeHint').hidden=true;empty.hidden=false;if(state.three)clearThreeGroup(state.three);return}const view=initThreeView();if(!view){$('crop3d').hidden=true;$('threeHint').hidden=true;empty.hidden=false;empty.textContent='3D 组件未加载，仍可使用左侧二维视图';return}$('crop3d').hidden=false;$('threeHint').hidden=false;empty.hidden=true;clearThreeGroup(view);const visibleFit=state.fit&&state.displayMode==='fit',fitRange=visibleFit?.stats?.elevation_range_m||null,reference=state.crop.stats.reference_z_range||state.crop.stats.class_1_plus_2_z_range||null,referenceRange=reference?.z_range||state.crop.stats.z_range||1,groundRange=fitRange?Math.max(.1,fitRange[1]-fitRange[0]):Math.max(.1,referenceRange),verticalScale=Math.max(.5,Math.min(4,state.selection.size_m/Math.max(groundRange*2,state.selection.size_m*.25)));view.group.scale.set(1,1,1);const baseZ=visibleFit?state.fit.vertical_origin_m:reference?.z_min??state.crop.origin_z;addRawThreePoints(view,state.crop.points,state.source.summary,state.crop,state.selection,baseZ,verticalScale);if(visibleFit)addFitThreePoints(view,state.fit,verticalScale);const floor=new THREE.GridHelper(state.selection.size_m,10,0x49616b,0x263840);floor.material.transparent=true;floor.material.opacity=.45;view.group.add(floor);const axis=new THREE.AxesHelper(state.selection.size_m*.3);view.group.add(axis);view.group.scale.y=1;view.target.set(0,Math.max(0,groundRange*verticalScale*.25),0);view.distance=Math.max(state.selection.size_m*1.55,groundRange*verticalScale*2.6);view.yaw=.8;view.pitch=.55;view.render()}
-function fitSummaryHtml(){if(!state.fit)return'';const s=state.fit.stats,voxel=s.voxel_size_m??0.2,coarse=s.coarse_resolution_m??s.surface_cell_size_m??0.4,grid=s.grid_resolution_m??0.2,flyers=s.low_flyer_removed||0,flyerLine=flyers?`<div>滤除低于裁块中位数 ${(s.low_flyer_below_m??30).toFixed(0)} m 的超低噪声 ${flyers} 点</div>`:'';return`<div class="fit-summary"><div>候选区原始点 ${s.raw_points_in_fit_margin.toLocaleString()} 点，参与拟合 ${s.fit_points.toLocaleString()} 点</div><div>${s.classification_policy}；YRF 地面带 [−${s.ground_band_below_m.toFixed(2)}, +${s.ground_band_above_m.toFixed(2)}] m</div><div>体素 ${voxel.toFixed(2)} m · 粗网格 ${coarse.toFixed(2)} m · 输出 ${grid.toFixed(2)} m（20 m 裁块，算法尺度与仿真相同）</div>${flyerLine}<div>高程网格观测 ${(s.observed_fraction*100).toFixed(1)}% · 高程范围 ${s.elevation_range_m[0].toFixed(2)}–${s.elevation_range_m[1].toFixed(2)} m</div><div>坡度 median ${s.slope_degrees.median.toFixed(1)}° / p95 ${s.slope_degrees.p95.toFixed(1)}° / max ${s.slope_degrees.maximum.toFixed(1)}°</div></div>`}
+function fitSummaryHtml(){if(!state.fit)return'';const s=state.fit.stats,voxel=s.voxel_size_m??0.1,coarse=s.coarse_resolution_m??s.surface_cell_size_m??0.2,grid=s.grid_resolution_m??0.1,flyers=s.low_flyer_removed||0,flyerLine=flyers?`<div>滤除低于裁块中位数 ${(s.low_flyer_below_m??30).toFixed(0)} m 的超低噪声 ${flyers} 点</div>`:'';return`<div class="fit-summary"><div>候选区原始点 ${s.raw_points_in_fit_margin.toLocaleString()} 点，参与拟合 ${s.fit_points.toLocaleString()} 点</div><div>${s.classification_policy}</div><div>体素 ${voxel.toFixed(2)} m · 粗网格 ${coarse.toFixed(2)} m 取最高点 · 输出 ${grid.toFixed(2)} m（40 m@0.2 m → 20 m@0.1 m，网络格数不变）</div>${flyerLine}<div>高程网格观测 ${(s.observed_fraction*100).toFixed(1)}% · 高程范围 ${s.elevation_range_m[0].toFixed(2)}–${s.elevation_range_m[1].toFixed(2)} m</div><div>坡度 median ${s.slope_degrees.median.toFixed(1)}° / p95 ${s.slope_degrees.p95.toFixed(1)}° / max ${s.slope_degrees.maximum.toFixed(1)}°</div></div>`}
 function setStatus(text){$('status').textContent=text}
 async function responseJson(response){let payload;try{payload=await response.json()}catch(_){payload={error:await response.text()}}if(!response.ok)throw new Error(payload.error||`HTTP ${response.status}`);return payload}
 async function postJson(url,body){return responseJson(await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}))}
