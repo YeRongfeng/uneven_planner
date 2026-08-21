@@ -3,8 +3,11 @@
 
 import datetime
 import json
+import pickle
 from collections import OrderedDict
 from pathlib import Path
+
+PATH_MAP_SLACK_SEC = 2.0
 
 
 SPLITS = ("train", "val")
@@ -238,6 +241,133 @@ def filled_records(state):
     for key, line_number, record in active_records(state):
         if fill_slot(record) is not None or state["slots"][key].get("filled"):
             result.append((key, line_number, record))
+    return result
+
+
+def current_round_filled_records(state):
+    """Fills in this 打回/补位 round: occupying fills newer than the latest return."""
+    last_return = ""
+    for _, record in state.get("review_records") or []:
+        if returned_slot(record) is not None:
+            last_return = max(last_return, _event_time(record))
+    for _, record in state.get("replacement_records") or []:
+        if record.get("status") in {"filled", "approved", "accepted"}:
+            continue
+        if _slot_value(record.get("map_index"), record.get("split")) is not None:
+            last_return = max(last_return, _event_time(record))
+    if not last_return:
+        return []
+    result = []
+    for key, line_number, record in filled_records(state):
+        if _event_time(record) > last_return:
+            result.append((key, line_number, record))
+    return result
+
+
+def env_results_match_canonical(dataset_root, split, index, canonical_map_path,
+                                expected_paths=1):
+    """True if this env already has a current-map test or a 打回 of this map."""
+    env_dir = Path(dataset_root) / split / f"env{int(index):06d}"
+    canonical = Path(canonical_map_path) if canonical_map_path else None
+    if canonical is None or not canonical.is_file() or not env_dir.is_dir():
+        return False
+    map_mtime = canonical.stat().st_mtime
+    marker = env_dir / "needs_return.json"
+    if marker.is_file() and marker.stat().st_mtime >= map_mtime:
+        return True
+    paths = list(env_dir.glob("path_*.p"))
+    if len(paths) < int(expected_paths):
+        return False
+    newest = max(path.stat().st_mtime for path in paths)
+    return newest >= map_mtime
+
+
+def _canonical_scene_and_split(canonical_map_path, expected_split=None):
+    path = Path(canonical_map_path)
+    scene = path.stem
+    split = expected_split
+    if split not in SPLITS:
+        parent = path.parent.name
+        split = parent if parent in SPLITS else None
+    return scene, split
+
+
+def existing_paths_belong_to_canonical(env_dir, canonical_map_path,
+                                       expected_split=None,
+                                       slack_sec=PATH_MAP_SLACK_SEC):
+    """True if existing path_*.p files were generated on this canonical map.
+
+    No paths is a match (nothing to conflict). A replaced canonical file
+    (newer than map.p) or a map.p that names a different source is not.
+    """
+    env_dir = Path(env_dir)
+    paths = list(env_dir.glob("path_*.p"))
+    if not paths:
+        return True
+    canonical = Path(canonical_map_path) if canonical_map_path else None
+    if canonical is None or not canonical.is_file():
+        return False
+    map_file = env_dir / "map.p"
+    if not map_file.is_file():
+        return False
+    try:
+        with map_file.open("rb") as stream:
+            map_data = pickle.load(stream)
+    except (OSError, pickle.UnpicklingError, AttributeError, EOFError):
+        return False
+    if not isinstance(map_data, dict):
+        return False
+    selected = canonical.resolve()
+    source_ok = False
+    stored = map_data.get("external_map_path")
+    if stored:
+        try:
+            source_ok = Path(stored).resolve() == selected
+        except OSError:
+            source_ok = False
+    if not source_ok:
+        source_map = map_data.get("source_map") or {}
+        scene, split = _canonical_scene_and_split(
+            canonical_map_path, expected_split)
+        source_ok = source_map.get("scene") == scene and (
+            split is None or source_map.get("split") == split)
+    if not source_ok:
+        return False
+    map_mtime = map_file.stat().st_mtime
+    canonical_mtime = canonical.stat().st_mtime
+    if canonical_mtime > map_mtime + slack_sec:
+        return False
+    return True
+
+
+def filled_slots_needing_work(state, dataset_root, split_map_paths,
+                              test_generation=False, expected_by_split=None):
+    """Filled slots that still need only-filled generation or testing.
+
+    Maps whose current canonical file is already covered by a successful
+    test or a 打回 of this map version are skipped.
+    """
+    dataset_root = Path(dataset_root)
+    expected_by_split = expected_by_split or {}
+    result = []
+    for key, line_number, record in filled_records(state):
+        split, index = key
+        expected = int(expected_by_split.get(split, 1))
+        paths = split_map_paths.get(split) or []
+        canonical = paths[index] if index < len(paths) else ""
+        if test_generation:
+            if env_results_match_canonical(
+                    dataset_root, split, index, canonical, expected):
+                continue
+        else:
+            env_dir = dataset_root / split / f"env{int(index):06d}"
+            if (env_dir / "needs_return.json").is_file():
+                continue
+            n_paths = (
+                len(list(env_dir.glob("path_*.p"))) if env_dir.is_dir() else 0)
+            if n_paths >= expected:
+                continue
+        result.append((key, line_number, record))
     return result
 
 

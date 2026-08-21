@@ -222,8 +222,7 @@ class DatasetCatalog:
             "score": quality.get("geometry_score"),
             "quality": quality.get("quality"),
             "quality_metrics": quality.get("metrics", {}),
-            "needs_return": (map_path.parent / "needs_return.json").is_file()
-            or bool(metadata.get("needs_return")),
+            "needs_return": (map_path.parent / "needs_return.json").is_file(),
             "metadata": metadata,
         }
         self.summary_cache[map_path] = (modified, summary)
@@ -240,8 +239,7 @@ class DatasetCatalog:
                 summary["path_count"] = len(paths)
                 if map_path.suffix != ".npz":
                     summary["needs_return"] = (
-                        (map_path.parent / "needs_return.json").is_file()
-                        or bool(summary.get("needs_return")))
+                        map_path.parent / "needs_return.json").is_file()
                 summary["live_token"] = (
                     f"{summary['artifact']}:{map_path.stat().st_mtime_ns}:"
                     f"{len(paths)}:{latest}:{int(bool(summary.get('needs_return')))}")
@@ -271,8 +269,7 @@ class DatasetCatalog:
             record["domain"] = summary["domain"]
             record["artifact"] = summary["artifact"]
             record["path_count"] = len(paths)
-            record["needs_return"] = bool(
-                summary.get("needs_return") or record.get("needs_return"))
+            record["needs_return"] = bool(summary.get("needs_return"))
             record["live_token"] = (
                 f"{summary['artifact']}:{map_path.stat().st_mtime_ns}:"
                 f"{len(paths)}:{latest}:{int(record['needs_return'])}")

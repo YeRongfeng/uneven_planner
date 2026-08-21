@@ -228,8 +228,7 @@ def trajectory_scene_record(map_path, trajectory_root, max_paths):
             "data": encode_bytes(points[:, :3]),
         })
 
-    if (map_path.parent / "needs_return.json").is_file():
-        metadata["needs_return"] = True
+    metadata["needs_return"] = (map_path.parent / "needs_return.json").is_file()
     relative = map_path.relative_to(trajectory_root)
     return make_record(
         scene_id=f"{relative.parts[-3]}/{map_path.parent.name}",

@@ -14,7 +14,9 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from review_slots import (
     active_records, append_return_record, append_returns_for_dataset,
-    filled_records, resolve_slots,
+    current_round_filled_records, env_results_match_canonical,
+    existing_paths_belong_to_canonical, filled_records,
+    filled_slots_needing_work, resolve_slots,
 )
 
 
@@ -51,6 +53,28 @@ class ReviewSlotTest(unittest.TestCase):
         self.assertEqual(
             [key for key, _, _ in filled_records(filled)],
             [("val", 26)])
+
+    def test_current_round_filled_records_ignore_older_fills(self):
+        state = self.resolve([
+            {"source_id": "old", "decision": "approve", "split": "train",
+             "timestamp_utc": "2026-01-01T00:00:00+00:00"},
+            {"source_id": "old", "decision": "return", "split": "train",
+             "map_index": 0, "timestamp_utc": "2026-01-01T00:01:00+00:00"},
+            {"source_id": "oldfill", "decision": "approve", "split": "train",
+             "fills_slot": {"split": "train", "map_index": 0},
+             "timestamp_utc": "2026-01-01T00:02:00+00:00"},
+            {"source_id": "old", "decision": "return", "split": "val",
+             "map_index": 1, "timestamp_utc": "2026-01-02T00:00:00+00:00"},
+            {"source_id": "newfill", "decision": "approve", "split": "val",
+             "fills_slot": {"split": "val", "map_index": 1},
+             "timestamp_utc": "2026-01-02T00:01:00+00:00"},
+        ])
+        self.assertEqual(
+            [key for key, _, _ in filled_records(state)],
+            [("train", 0), ("val", 1)])
+        self.assertEqual(
+            [key for key, _, _ in current_round_filled_records(state)],
+            [("val", 1)])
 
     def test_filled_records_ignore_baseline_approvals(self):
         state = self.resolve([
@@ -118,6 +142,35 @@ class ReviewSlotTest(unittest.TestCase):
                 [slot["key"] for slot in state["open_slots"]],
                 ["val/map_003"])
 
+    def test_passed_fill_is_skipped_by_only_filled_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "maps" / "val" / "map_003.pcd"
+            canonical.parent.mkdir(parents=True)
+            canonical.write_text("pcd", encoding="utf-8")
+            env = root / "val" / "env000003"
+            env.mkdir(parents=True)
+            path = env / "path_000000.p"
+            path.write_text("path", encoding="utf-8")
+            import os
+            os.utime(canonical, (1_000_000_000, 1_000_000_000))
+            os.utime(path, (1_000_000_100, 1_000_000_100))
+            self.assertTrue(env_results_match_canonical(
+                root, "val", 3, canonical, 1))
+            review = root / "manual_regions.jsonl"
+            review.write_text(
+                json.dumps({
+                    "source_id": "a.laz", "decision": "approve", "split": "val",
+                    "fills_slot": {"split": "val", "map_index": 3},
+                    "timestamp_utc": "2026-01-02T00:00:00+00:00",
+                }) + "\n",
+                encoding="utf-8")
+            state = resolve_slots(review)
+            needed = filled_slots_needing_work(
+                state, root, {"val": [None, None, None, str(canonical)]},
+                test_generation=True, expected_by_split={"val": 1})
+            self.assertEqual(needed, [])
+
     def test_stale_needs_return_does_not_reopen_a_filled_slot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -144,6 +197,60 @@ class ReviewSlotTest(unittest.TestCase):
             self.assertEqual(
                 [key for key, _, _ in filled_records(state)],
                 [("val", 3)])
+
+    def test_existing_paths_belong_to_canonical(self):
+        import os
+        import pickle
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "val" / "map_003.pcd"
+            other = root / "train" / "map_004.pcd"
+            canonical.parent.mkdir(parents=True)
+            other.parent.mkdir(parents=True)
+            canonical.write_text("pcd", encoding="utf-8")
+            other.write_text("other", encoding="utf-8")
+            env = root / "env000003"
+            env.mkdir()
+            self.assertTrue(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
+
+            (env / "path_0.p").write_bytes(b"path")
+            self.assertFalse(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
+
+            with (env / "map.p").open("wb") as stream:
+                pickle.dump({
+                    "source_map": {"scene": "map_003", "split": "val"},
+                }, stream)
+            os.utime(canonical, (1_000_000_000, 1_000_000_000))
+            os.utime(env / "map.p", (1_000_000_100, 1_000_000_100))
+            os.utime(env / "path_0.p", (1_000_000_200, 1_000_000_200))
+            self.assertTrue(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
+
+            os.utime(canonical, (1_000_000_300, 1_000_000_300))
+            self.assertFalse(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
+
+            os.utime(canonical, (1_000_000_000, 1_000_000_000))
+            with (env / "map.p").open("wb") as stream:
+                pickle.dump({
+                    "source_map": {"scene": "map_004", "split": "train"},
+                    "external_map_path": str(other),
+                }, stream)
+            os.utime(env / "map.p", (1_000_000_100, 1_000_000_100))
+            self.assertFalse(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
+
+            with (env / "map.p").open("wb") as stream:
+                pickle.dump({
+                    "source_map": {"scene": "map_003", "split": "val"},
+                    "external_map_path": str(canonical),
+                }, stream)
+            os.utime(env / "map.p", (1_000_000_100, 1_000_000_100))
+            self.assertTrue(existing_paths_belong_to_canonical(
+                env, canonical, expected_split="val"))
 
 
 if __name__ == "__main__":

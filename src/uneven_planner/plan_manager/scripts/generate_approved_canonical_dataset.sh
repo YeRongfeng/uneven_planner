@@ -168,7 +168,7 @@ reset_test_range() {
 }
 
 worker_failed() {
-    rg -q '"status"[[:space:]]*:[[:space:]]*"failed"' \
+    grep -q '"status"[[:space:]]*:[[:space:]]*"failed"' \
         "${output_dir}"/experiment_manifest_worker_*.json 2>/dev/null
 }
 
@@ -209,19 +209,12 @@ run_launch() {
         train_external_site_id:="${train_site_id}"
         val_external_site_id:="${val_site_id}"
     )
-    if [[ "${phase}" == "phase_a" ]]; then
-        split_args+=(
-            train_external_map_paths:="${train_pool}"
-            val_external_map_paths:="${val_pool}"
-            canonical_primary_scene_count:="${environments}"
-            canonical_pool_start_env_id:="${start_env}"
-        )
-    else
-        split_args+=(
-            canonical_primary_scene_count:="${environments}"
-            canonical_pool_start_env_id:="${start_env}"
-        )
-    fi
+    split_args+=(
+        train_external_map_paths:="${train_pool}"
+        val_external_map_paths:="${val_pool}"
+        canonical_primary_scene_count:="${environments}"
+        canonical_pool_start_env_id:="${start_env}"
+    )
 
     local start_phase="train"
     local stop_after="false"
@@ -253,8 +246,8 @@ run_launch() {
         start_phase:="${start_phase}" \
         dataset_dir:="${output_dir}" \
         start_env_id:="${start_env}" \
-        external_map_path:="${train_map_list}" \
-        external_map_paths:="${train_map_list}" \
+        external_map_path:="${train_pool}" \
+        external_map_paths:="${train_pool}" \
         external_map_format:=pcd \
         external_domain:="${domain}" \
         external_map_is_canonical:=true \
@@ -346,13 +339,14 @@ if [[ "${only_filled_slots}" == "1" ]]; then
     filled_values=()
     while IFS= read -r value; do
         filled_values+=("${value}")
-    done < <(python3 - "${manifest}" "${script_dir}" <<'PY'
+    done < <(python3 - "${manifest}" "${script_dir}" "${output_dir}" \
+        "${test_generation}" "${train_paths}" "${val_paths}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[2])
-from review_slots import filled_records, resolve_slots
+from review_slots import filled_slots_needing_work, resolve_slots
 
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 review = manifest.get("review_file")
@@ -361,8 +355,16 @@ if not review:
 replacement = manifest.get("replacement_file") or str(
     Path(review).with_name("canonical_replacements.jsonl"))
 state = resolve_slots(review, replacement)
-train = sorted({key[1] for key, _, _ in filled_records(state) if key[0] == "train"})
-val = sorted({key[1] for key, _, _ in filled_records(state) if key[0] == "val"})
+test = sys.argv[4] == "1"
+expected = {"train": 1 if test else int(sys.argv[5]),
+            "val": 1 if test else int(sys.argv[6])}
+filled = filled_slots_needing_work(
+    state, sys.argv[3],
+    {"train": manifest.get("train_maps") or [],
+     "val": manifest.get("val_maps") or []},
+    test_generation=test, expected_by_split=expected)
+train = sorted({key[1] for key, _, _ in filled if key[0] == "train"})
+val = sorted({key[1] for key, _, _ in filled if key[0] == "val"})
 print(",".join(str(index) for index in train))
 print(",".join(str(index) for index in val))
 PY
@@ -370,7 +372,7 @@ PY
     filled_train="${filled_values[0]}"
     filled_val="${filled_values[1]}"
     if [[ -z "${filled_train}" && -z "${filled_val}" ]]; then
-        echo "没有已补位的地图可测试或生成轨迹" >&2
+        echo "没有尚未完成的补位地图可测试或生成轨迹（已通过的补位会跳过）" >&2
         exit 1
     fi
     declare -A do_train=()

@@ -84,6 +84,7 @@ from sample_laz_mother_map import (
     measure_classified_above_surface_coverage,
 )
 from terrain_map_quality import evaluate as evaluate_terrain_map
+from review_slots import existing_paths_belong_to_canonical
 
 # ROS消息类型
 from geometry_msgs.msg import PoseStamped
@@ -1524,10 +1525,9 @@ class TerrainDatasetGenerator:
         self.val_external_map_paths = self._parse_map_paths(
             rospy.get_param('~val_external_map_paths', []))
         self.has_split_map_pools = bool(
-            self.train_external_map_paths or self.val_external_map_paths)
-        if self.has_split_map_pools:
-            if (not self.train_external_map_paths or
-                    not self.val_external_map_paths):
+            self.train_external_map_paths and self.val_external_map_paths)
+        if self.train_external_map_paths or self.val_external_map_paths:
+            if not self.has_split_map_pools:
                 raise ValueError(
                     "train_external_map_paths and val_external_map_paths "
                     "must both be provided")
@@ -1535,8 +1535,8 @@ class TerrainDatasetGenerator:
                 self.train_external_map_paths + self.val_external_map_paths))
             self.external_map_path = self.train_external_map_paths[0]
         else:
-            self.train_external_map_paths = self.external_map_paths
-            self.val_external_map_paths = self.external_map_paths
+            self.train_external_map_paths = list(self.external_map_paths)
+            self.val_external_map_paths = list(self.external_map_paths)
         self.current_external_map_index = None
         self.external_map_format = rospy.get_param(
             '~external_map_format', 'pcd')  # 支持 pcd/ply/txt/heightmap/las/laz
@@ -1618,6 +1618,11 @@ class TerrainDatasetGenerator:
             rospy.get_param('~external_min_tree_component_cells', 0))
         self.external_map_is_canonical = bool(
             rospy.get_param('~external_map_is_canonical', False))
+        if (self.use_external_map and self.external_map_is_canonical
+                and not self.has_split_map_pools):
+            raise ValueError(
+                "canonical maps require train_external_map_paths and "
+                "val_external_map_paths so val does not reuse the train pool")
         self.canonical_maps_per_environment = int(
             rospy.get_param('~canonical_maps_per_environment', 1))
         if self.canonical_maps_per_environment <= 0:
@@ -1802,6 +1807,7 @@ class TerrainDatasetGenerator:
         self.paths_generated_for_current_env = 0
         self.scene_failed_attempts = 0
         self._env_skip_status = None
+        self._resume_existing_map = False
         self.waiting_for_result = False
         self.current_trajectory = None
         self.map_update_timeout = rospy.get_param('~map_update_timeout', 10.0)
@@ -2071,7 +2077,10 @@ class TerrainDatasetGenerator:
                        if self.current_phase == 'train'
                        else self.val_external_map_paths)
         source_count = len(phase_paths)
-        if self.external_map_is_canonical and self.has_split_map_pools:
+        if self.external_map_is_canonical:
+            if not self.has_split_map_pools:
+                raise RuntimeError(
+                    "canonical generation requires split train/val map pools")
             local_environment = (
                 self.current_env_id - self.canonical_pool_start_env_id)
             replacement_round = self.canonical_replacement_round.get(
@@ -2905,6 +2914,38 @@ class TerrainDatasetGenerator:
         with open(metadata_path, encoding='utf-8') as stream:
             return json.load(stream)
     
+    @staticmethod
+    def _remove_env_path_files(env_dir):
+        removed = 0
+        for path_file in glob.glob(os.path.join(env_dir, "path_*.p")):
+            try:
+                os.remove(path_file)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    @staticmethod
+    def _compact_env_path_files(env_dir):
+        """Rename path_*.p to a contiguous path_0..path_{n-1} sequence."""
+        files = []
+        for path_file in glob.glob(os.path.join(env_dir, "path_*.p")):
+            stem = os.path.splitext(os.path.basename(path_file))[0]
+            try:
+                files.append((int(stem.split("_", 1)[1]), path_file))
+            except (IndexError, ValueError):
+                continue
+        files.sort()
+        for new_id, (_, path_file) in enumerate(files):
+            dest = os.path.join(env_dir, f"path_{new_id}.p")
+            if os.path.abspath(path_file) == os.path.abspath(dest):
+                continue
+            if os.path.exists(dest):
+                raise RuntimeError(
+                    f"Cannot compact path files in {env_dir}: {dest} exists")
+            os.rename(path_file, dest)
+        return len(files)
+
     def generate_new_environment(self):
         """生成新的地形环境"""
         env_name = f"env{self.current_env_id:06d}"
@@ -2916,22 +2957,33 @@ class TerrainDatasetGenerator:
             env_dir = os.path.join(self.val_dir, env_name)
         
         os.makedirs(env_dir, exist_ok=True)
-        import glob
         self._env_skip_status = None
+        self._resume_existing_map = False
         if self.external_map_is_canonical and self.mark_unplannable_canonical:
             # Unchecked test generation must re-try the current canonical
             # map. Old 打回 markers and the previous 1 path belong to the
             # last test, not this map version.
             self.clear_canonical_needs_return(env_dir)
-            for path_file in glob.glob(os.path.join(env_dir, "path_*.p")):
-                try:
-                    os.remove(path_file)
-                except OSError:
-                    pass
+            self._remove_env_path_files(env_dir)
             self.current_path_id = 0
             self.paths_generated_for_current_env = 0
         elif self.external_map_is_canonical:
-            skip_status = self.canonical_env_skip_status(env_dir)
+            if os.path.isfile(os.path.join(env_dir, "needs_return.json")):
+                skip_status = "needs_return"
+            else:
+                if self.use_external_map:
+                    selected_map_path = self.select_external_map_path()
+                    if not existing_paths_belong_to_canonical(
+                            env_dir, selected_map_path,
+                            expected_split=self.current_phase):
+                        discarded = self._remove_env_path_files(env_dir)
+                        if discarded:
+                            rospy.logwarn(
+                                "Discarding %d stale %s %s trajectories; "
+                                "they were not generated on %s",
+                                discarded, self.current_phase, env_name,
+                                selected_map_path)
+                skip_status = self.canonical_env_skip_status(env_dir)
             if skip_status:
                 self._env_skip_status = skip_status
                 existing = glob.glob(os.path.join(env_dir, "path_*.p"))
@@ -2941,10 +2993,11 @@ class TerrainDatasetGenerator:
                     "Skipping %s %s (%s, existing paths=%d)",
                     self.current_phase, env_name, skip_status, len(existing))
                 return env_dir
-            existing = sorted(glob.glob(os.path.join(env_dir, "path_*.p")))
-            if existing:
-                self.current_path_id = len(existing)
-                self.paths_generated_for_current_env = len(existing)
+            existing_count = self._compact_env_path_files(env_dir)
+            if existing_count:
+                self.current_path_id = existing_count
+                self.paths_generated_for_current_env = existing_count
+                self._resume_existing_map = True
                 rospy.loginfo(
                     "Resuming %s %s from path_%d",
                     self.current_phase, env_name, self.current_path_id)
@@ -2955,13 +3008,10 @@ class TerrainDatasetGenerator:
         # 如果重新生成，清理旧的路径文件但保留目录结构
         if not (self.external_map_is_canonical
                 and self.paths_generated_for_current_env > 0):
-            path_files = glob.glob(os.path.join(env_dir, "path_*.p"))
-            for path_file in path_files:
-                try:
-                    os.remove(path_file)
-                    rospy.loginfo(f"Removed old path file: {os.path.basename(path_file)}")
-                except OSError:
-                    pass
+            removed = self._remove_env_path_files(env_dir)
+            if removed:
+                rospy.loginfo(
+                    "Removed %d old path file(s) in %s", removed, env_name)
         
         rospy.loginfo(f"Generating environment {env_name} for {self.current_phase} phase")
         
@@ -3289,6 +3339,7 @@ class TerrainDatasetGenerator:
                 'shape': grid_map_tensor.shape,
                 'source': 'external_map',
                 'dataset_phase': self.current_phase,
+                'external_map_path': os.path.abspath(self.external_map_path),
                 'original_map_path': (
                     None if self.external_map_is_canonical
                     else self.external_map_path),
@@ -3395,14 +3446,16 @@ class TerrainDatasetGenerator:
             update_response.internal_yaw_bins)
 
         map_file = os.path.join(env_dir, 'map.p')
-        with open(map_file, 'wb') as f:
-            pickle.dump(map_data, f)
-        rospy.loginfo(f"Saved map data: {map_file}")
-        
-        # 保存地形可视化
-        self.save_terrain_visualizations(
-            heightmap, terrain_info, env_dir, pointcloud=pcd,
-            grid_map_data=grid_map_data)
+        if self._resume_existing_map and os.path.isfile(map_file):
+            rospy.loginfo(
+                "Keeping existing map.p while resuming paths: %s", map_file)
+        else:
+            with open(map_file, 'wb') as f:
+                pickle.dump(map_data, f)
+            rospy.loginfo(f"Saved map data: {map_file}")
+            self.save_terrain_visualizations(
+                heightmap, terrain_info, env_dir, pointcloud=pcd,
+                grid_map_data=grid_map_data)
         
         # These latched topics are diagnostics/backward compatibility only.
         # Planning synchronization is exclusively the service response above.

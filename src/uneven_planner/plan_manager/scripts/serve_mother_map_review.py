@@ -722,8 +722,15 @@ class ReviewStore:
                 for key, entry in state["baseline"].items()
             }
             result = []
+            deleted = state.get("deleted_targets") or {}
             for line_number, record in read_jsonl(self.path):
                 if record.get("source_id") != source_id:
+                    continue
+                if record.get("decision") == "delete":
+                    continue
+                target = (record.get("source_id", ""),
+                          record.get("timestamp_utc", ""))
+                if target in deleted:
                     continue
                 updated = dict(record)
                 baseline = baseline_by_line.get(line_number)
@@ -796,6 +803,38 @@ class ReviewStore:
                     dict(record) for record in records
                     if record.get("source_id") == source_id
                 ],
+            }
+
+    def delete_record(self, source_id, timestamp_utc):
+        with self.lock:
+            matches = [
+                index for index, record in enumerate(self.records)
+                if (record.get("source_id") == source_id
+                    and record.get("timestamp_utc") == timestamp_utc)
+            ]
+            if len(matches) != 1:
+                raise FileNotFoundError(
+                    "review record was not found; reload the review file")
+            target = self.records[matches[0]]
+            if target.get("decision") not in {"approve", "reject"}:
+                raise ValueError("只能删除通过或拒绝的标注")
+            record = {
+                "source_id": source_id,
+                "decision": "delete",
+                "target_timestamp_utc": timestamp_utc,
+                "timestamp_utc": datetime.datetime.now(
+                    datetime.timezone.utc).isoformat(),
+            }
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            self.records.append(record)
+            self._mtime_ns = self.path.stat().st_mtime_ns
+            return {
+                "deleted": True,
+                "review_counts": self.counts(source_id),
+                "review_split_counts": self.split_counts(source_id),
+                "review_records": self.records_for(source_id),
             }
 
 
@@ -1216,7 +1255,7 @@ HTML_TEMPLATE = r'''<!doctype html>
       <div class="workflow-copy">把你标记为“通过”的区域制作成训练程序能使用的地图文件。这是自动中间步骤，点击按钮即可，下一步会自动使用生成结果。</div>
       <div id="canonicalInfo" class="workflow-path">等待人工筛选结果</div>
       <div class="generation-action"><button id="exportCanonical">生成训练用地图</button><label><input id="overwriteCanonical" type="checkbox">覆盖已有训练用地图</label><label><input id="onlyFilledSlots" type="checkbox">仅生成已补位的地图</label></div>
-      <div class="hint">“覆盖已有”会清空旧中间地图再全量重建。“仅生成已补位”只重写打回后已经补上的那个编号，例如 val/map_026 就是 map_026。</div>
+      <div class="hint">“覆盖已有”会清空旧中间地图再全量重建。“仅生成已补位”只生成还没有对应中间图的补位编号；已经按该条通过记录生成过的图会跳过。</div>
       <details class="advanced"><summary>更改训练地图的保存位置</summary>
         <div class="workflow-copy">通常不需要修改。这里保存的是中间地图，不是最终训练数据。</div>
         <div class="control full path-control"><span class="path-label">训练地图文件夹</span><div class="path-row"><input id="canonicalDir" spellcheck="false"><button id="browseCanonicalDir">浏览</button></div></div>
@@ -1228,7 +1267,7 @@ HTML_TEMPLATE = r'''<!doctype html>
       <div id="datasetInfo" class="workflow-path">请先完成上一步</div>
       <div class="generation-action"><button id="testDataset">测试生成（每张1条）</button><label><input id="onlyFilledTest" type="checkbox">仅测试已补位的地图</label></div>
       <div class="generation-action"><button id="generateDataset">生成最终训练数据</button><label><input id="onlyFilledDataset" type="checkbox">仅生成已补位地图的轨迹</label></div>
-      <div class="hint">测试生成：每张图先出 1 条，换 30 对起终点仍为 0 条则标「需要打回」。不勾选会按当前中间图重测全部，并清掉上次测试的 1 条和打回标记。勾选「仅测试已补位」只重测刚补上的编号。正式生成不再打回，只给未完成的图补全轨迹；已标打回的图会跳过。勾选「仅生成已补位」只给那些编号补轨迹。</div>
+      <div class="hint">测试生成：每张图先出 1 条，换 30 对起终点仍为 0 条则标「需要打回」。不勾选会按当前中间图重测全部，并清掉上次测试的 1 条和打回标记。勾选「仅测试已补位」只测还没有对应当前中间图结果的补位（已通过的补位会跳过）。正式生成不再打回，只给未完成的图补全轨迹；已标打回的图会跳过。勾选「仅生成已补位」只给尚未补齐轨迹的补位编号出轨迹。</div>
       <details class="advanced"><summary>调整生成数量或保存位置</summary>
         <div class="control full path-control"><span class="path-label">最终数据文件夹</span><div class="path-row"><input id="datasetDir" spellcheck="false"><button id="browseDatasetDir">浏览</button></div></div>
         <div class="control full generation-counts"><label>训练集轨迹数/每张地图<input id="trainPaths" type="number" min="1" step="1" value="100"></label><label>验证集轨迹数/每张地图<input id="valPaths" type="number" min="1" step="1" value="10"></label></div>
@@ -1246,7 +1285,7 @@ HTML_TEMPLATE = r'''<!doctype html>
 <div class="pane-splitter left-splitter" id="leftSplitter" role="separator" aria-label="调整左侧栏宽度" aria-orientation="vertical" tabindex="0" title="拖动调整左侧栏宽度"></div>
 <main class="map-area"><div class="map-wrap"><canvas id="map"></canvas><div class="map-hint">拖动框选候选区域 · Shift+拖动平移 · 滚轮缩放</div></div></main>
 <div class="pane-splitter right-splitter" id="rightSplitter" role="separator" aria-label="调整右侧栏宽度" aria-orientation="vertical" tabindex="0" title="拖动调整右侧栏宽度"></div>
-<aside class="right" id="right"><div class="crop-title"><h2>候选区域详情</h2><span id="decisionStatus" class="hint">未选择</span></div><div class="crop-wrap" id="cropWrap"><div class="empty">在原始地图上框选或点击“随机选一块”</div><canvas id="crop" hidden></canvas></div><div class="crop-wrap crop-3d-wrap" id="crop3dWrap"><div class="empty">选择候选区域后显示 3D 点云</div><div id="crop3d" hidden></div><div class="three-hint" id="threeHint" hidden>拖动旋转 · 滚轮缩放</div></div><div id="cropStats"></div><div class="fit-actions"><button id="runFit" disabled>拟合地形</button></div><div class="section" style="margin-top:12px;border:0"><div class="control full"><label>放入<select id="split"><option value="train">训练集</option><option value="val">验证集</option><option value="unassigned">未分配（历史记录）</option></select></label></div><div class="slot-box"><label>补充空位<select id="fillSlot"><option value="">不补充</option><option value="train">补充 train</option><option value="val">补充 val</option></select></label><div id="fillSlotHint" class="hint"></div></div><div class="review-update"><span id="reviewEditStatus" class="hint">未加载历史记录</span><button id="updateReviewSplit" disabled>更新当前历史记录归属</button></div><textarea id="note" class="note" placeholder="备注（可选）"></textarea><div class="review-actions"><button class="good" id="approve">通过并保存</button><button class="bad" id="reject">拒绝并保存</button><button id="approveNext">通过并随机下一块</button><button class="bad" id="rejectNext">拒绝并随机下一块</button></div></div></aside>
+<aside class="right" id="right"><div class="crop-title"><h2>候选区域详情</h2><span id="decisionStatus" class="hint">未选择</span></div><div class="crop-wrap" id="cropWrap"><div class="empty">在原始地图上框选或点击“随机选一块”</div><canvas id="crop" hidden></canvas></div><div class="crop-wrap crop-3d-wrap" id="crop3dWrap"><div class="empty">选择候选区域后显示 3D 点云</div><div id="crop3d" hidden></div><div class="three-hint" id="threeHint" hidden>拖动旋转 · 滚轮缩放</div></div><div id="cropStats"></div><div class="fit-actions"><button id="runFit" disabled>拟合地形</button></div><div class="section" style="margin-top:12px;border:0"><div class="control full"><label>放入<select id="split"><option value="train">训练集</option><option value="val">验证集</option><option value="unassigned">未分配（历史记录）</option></select></label></div><div class="slot-box"><label>补充空位<select id="fillSlot"><option value="">不补充</option><option value="train">补充 train</option><option value="val">补充 val</option></select></label><div id="fillSlotHint" class="hint"></div></div><div class="review-update"><span id="reviewEditStatus" class="hint">未加载历史记录</span><button id="updateReviewSplit" disabled>更新当前历史记录归属</button><button id="deleteReview" class="bad" disabled>删除这条标注</button></div><textarea id="note" class="note" placeholder="备注（可选）"></textarea><div class="review-actions"><button class="good" id="approve">通过并保存</button><button class="bad" id="reject">拒绝并保存</button><button id="approveNext">通过并随机下一块</button><button class="bad" id="rejectNext">拒绝并随机下一块</button></div></div></aside>
 </div>
 <div id="pathPicker" class="picker-backdrop" hidden><div class="picker" role="dialog" aria-modal="true" aria-labelledby="pickerTitle"><div class="picker-head"><h2 id="pickerTitle">选择位置</h2><button id="closePicker">取消</button></div><div class="picker-bar"><button id="pickerUp">上一级</button><input id="pickerPath" readonly aria-label="当前位置"><button id="pickerGo" hidden>转到</button></div><div id="pickerList" class="picker-list"></div><div class="picker-foot"><span id="pickerCurrent" class="workflow-path"></span><button id="usePickerPath" hidden>使用当前路径</button><button id="usePickerDirectory">选择这个文件夹</button></div></div></div>
 <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
@@ -1347,7 +1386,7 @@ function renderSource(){const s=currentSummary();if(!s)return;$('sourceMeta').in
 const classNames={0:'从未分类',1:'未分类',2:'地面',3:'低植被',4:'中植被',5:'高植被',6:'建筑物',7:'低点/噪声',8:'模型关键点',9:'水体',10:'铁路',11:'道路表面',12:'重叠点',18:'高噪声'};
 function classTable(counts,ranges,total,allRange){const entries=Object.entries(counts||{}).sort((a,b)=>+a[0]-+b[0]);if(!entries.length)return`<table class="class-table"><thead><tr><th>类别</th><th>点数</th><th>高差</th></tr></thead><tbody><tr><td>全部点（无 LAS 分类）</td><td>${Number(total||0).toLocaleString()}</td><td>${rangeText(allRange)}</td></tr></tbody></table>`;return'<table class="class-table"><thead><tr><th>类别</th><th>点数</th><th>高差</th></tr></thead><tbody>'+entries.map(([k,v])=>`<tr><td>class ${k} · ${classNames[k]||'其他 LAS 类别'}</td><td>${Number(v).toLocaleString()}</td><td>${rangeText(ranges?.[k])}</td></tr>`).join('')+'</tbody></table>'}
 function rangeText(value){return value&&Number.isFinite(value.z_range)?value.z_range.toFixed(2)+' m':'—'}
-function updateReviewControls(){const button=$('updateReviewSplit'),status=$('reviewEditStatus'),record=state.reviewRecord,split=$('split').value;if(!record){button.disabled=true;status.textContent='未加载历史记录';return}if(record.decision==='return'){button.disabled=true;status.textContent='这是已打回的地图空位，请在“补充空位”中选择它';return}if(record.decision!=='approve'){button.disabled=true;status.textContent='当前是拒绝记录，不参与训练集/验证集地图生成';return}if(record.fills_slot){button.disabled=true;status.textContent='这是已补位记录，不能单独修改数据集归属';return}if(!record.timestamp_utc){button.disabled=true;status.textContent='这条旧记录缺少时间戳，无法精确更新';return}button.disabled=split==='unassigned'||split===record.split;status.textContent=`当前历史记录：${reviewSplitLabel(record)}${split!==record.split&&split!=='unassigned'?' · 选择后可更新':''}`}
+function updateReviewControls(){const button=$('updateReviewSplit'),del=$('deleteReview'),status=$('reviewEditStatus'),record=state.reviewRecord,split=$('split').value;if(del)del.disabled=true;if(!record){button.disabled=true;status.textContent='未加载历史记录';return}if(record.decision==='return'){button.disabled=true;status.textContent='这是已打回的地图空位，请在“补充空位”中选择它';return}if(!record.timestamp_utc){button.disabled=true;status.textContent='这条旧记录缺少时间戳，无法精确更新';return}if(del&&(record.decision==='approve'||record.decision==='reject'))del.disabled=false;if(record.decision!=='approve'){button.disabled=true;status.textContent=record.decision==='reject'?'当前是拒绝记录，可删除，不参与生成':'未加载历史记录';return}if(record.fills_slot){button.disabled=true;status.textContent='这是已补位记录。可删除，删除后该空位会重新打开。';return}button.disabled=split==='unassigned'||split===record.split;status.textContent=`当前历史记录：${reviewSplitLabel(record)}${split!==record.split&&split!=='unassigned'?' · 选择后可更新':''}`}
 function updateFitButton(){const button=$('runFit');if(!state.crop){button.disabled=true;button.textContent='拟合地形';return}button.disabled=false;button.textContent=!state.fit?'拟合地形':state.displayMode==='fit'?'显示原点云':'显示拟合结果'}
 function renderCropStats(){if(!state.crop){$('cropStats').innerHTML='';$('decisionStatus').textContent='未选择';updateFitButton();updateReviewControls();return}const s=state.crop.stats,sel=state.selection,byClass=s.z_range_by_class||{};$('decisionStatus').textContent=`中心 ${sel.center_xy[0].toFixed(2)}, ${sel.center_xy[1].toFixed(2)}`;updateFitButton();updateReviewControls();$('cropStats').innerHTML=`<div class="stats"><div class="stat"><div class="k">原始/显示点数</div><div class="v">${s.point_count.toLocaleString()} / ${s.display_point_count.toLocaleString()}</div></div><div class="stat"><div class="k">1m 网格占用</div><div class="v">${(s.occupied_1m_fraction*100).toFixed(1)}%</div></div>${classTable(s.class_counts,byClass,s.point_count,s.z_range)}${fitSummaryHtml()}`}
 async function loadSource(id){state.sourceId=id;const sourceToken=++state.sourceToken;state.source=null;state.crop=null;state.fit=null;state.displayMode='raw';state.selection=null;state.reviewRecord=null;state.fillSlotKey='';state.selectedReviewTimestamps.clear();$('split').value='train';renderCropStats();renderCrop3d();setStatus('正在读取母图预览…');const r=await fetch('/api/source?id='+encodeURIComponent(id));if(!r.ok)throw new Error(await r.text());const payload=await r.json();if(sourceToken!==state.sourceToken||state.sourceId!==id)return;state.source=payload;OPEN_SLOTS=payload.open_slots||OPEN_SLOTS;state.source.pointData=decode(payload.points);$('source').value=id;renderOpenSlots();renderSource();setStatus('可框选候选区域');draw()}
@@ -1359,6 +1398,7 @@ async function runFit(){if(!state.crop||!state.selection)return;if(state.fit){st
 function applyReviewResponse(response){if(response.sources)SOURCES=response.sources;state.source.review_counts=response.review_counts||state.source.review_counts;state.source.review_split_counts=response.review_split_counts||state.source.review_split_counts;state.source.review_records=response.review_records||reviewRecords();OPEN_SLOTS=response.open_slots||OPEN_SLOTS;state.source.open_slots=OPEN_SLOTS;renderOpenSlots();if(state.reviewRecord?.timestamp_utc){const current=state.source.review_records.find(record=>record.timestamp_utc===state.reviewRecord.timestamp_utc);state.reviewRecord=current||null;if(current)$('split').value=current.split==='val'?'val':current.split==='train'?'train':'unassigned'}const sourceIndex=SOURCES.findIndex(source=>source.id===state.sourceId);if(sourceIndex>=0){SOURCES[sourceIndex].review_counts=state.source.review_counts;SOURCES[sourceIndex].review_split_counts=state.source.review_split_counts}}
 async function review(decision,thenNext=false){if(!state.crop||!state.selection)return;if($('split').value==='unassigned'){setStatus('新审核记录必须选择训练集或验证集');return}const s=state.selection,slot=decision==='approve'?nextOpenSlot(state.fillSlotKey):null;if(decision==='approve'&&state.fillSlotKey&&!slot){setStatus(state.fillSlotKey?`没有可补充的 ${state.fillSlotKey} 空位`:'这个待补位已被其他操作处理，请重新读取');return}const body={source_id:state.sourceId,decision,split:slot?slot.split:$('split').value,center_xy:s.center_xy,size_m:s.size_m,yaw_deg:s.yaw_deg,note:$('note').value,stats:state.crop.stats,fit:state.fit?{method:state.fit.method,stats:state.fit.stats}:null};if(slot)body.fills_slot={split:slot.split,map_index:slot.map_index};const r=await fetch('/api/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());const response=await r.json();applyReviewResponse(response);state.reviewRecord=null;if(!nextOpenSlot(state.fillSlotKey))state.fillSlotKey='';renderOpenSlots();renderSource();updateReviewControls();updateWorkflowLinks({sources:SOURCES,open_slots:OPEN_SLOTS,review_file:CONFIG.review_file,default_domain:CONFIG.default_domain,dataset_viewer_url:CONFIG.dataset_viewer_url,workspace_root:CONFIG.workspace_root});$('note').value='';setStatus(decision==='approve'?(slot?`已补充 ${slot.key}`:'已记录通过'):'已记录拒绝');if(thenNext)await randomCandidate()}
 async function updateReviewSplit(){const record=state.reviewRecord,split=$('split').value;if(!record||record.decision!=='approve'||!record.timestamp_utc)return;if(split==='unassigned'){setStatus('请选择训练集或验证集后再更新');return}setStatus('正在更新历史记录归属…');const response=await postJson('/api/update-review',{source_id:state.sourceId,timestamp_utc:record.timestamp_utc,split});applyReviewResponse(response);renderReviewHistory();updateReviewControls();updateWorkflowLinks({sources:SOURCES,review_file:CONFIG.review_file,default_domain:CONFIG.default_domain,dataset_viewer_url:CONFIG.dataset_viewer_url,workspace_root:CONFIG.workspace_root});draw();setStatus(`历史记录已调整为${reviewSplitLabel(response.record)}`)}
+async function deleteReview(){const record=state.reviewRecord;if(!record||!record.timestamp_utc||(record.decision!=='approve'&&record.decision!=='reject'))return;const fill=record.fills_slot,msg=fill?'删除这条补位通过记录？该空位会重新打开。':'删除这条标注？它将不再参与生成。若它不是该集最后一个编号，后面地图编号可能前移。';if(!window.confirm(msg))return;setStatus('正在删除标注…');const response=await postJson('/api/delete-review',{source_id:state.sourceId,timestamp_utc:record.timestamp_utc});state.reviewRecord=null;applyReviewResponse(response);renderReviewHistory();updateReviewControls();updateWorkflowLinks({sources:SOURCES,review_file:CONFIG.review_file,default_domain:CONFIG.default_domain,dataset_viewer_url:CONFIG.dataset_viewer_url,workspace_root:CONFIG.workspace_root});draw();setStatus('这条标注已删除')}
 async function updateSelectedReviewSplits(){const timestamps=[...state.selectedReviewTimestamps],split=$('bulkSplit').value;if(!timestamps.length)return;setStatus(`正在批量更新 ${timestamps.length} 条历史记录…`);const response=await postJson('/api/update-review-batch',{source_id:state.sourceId,timestamps_utc:timestamps,split});applyReviewResponse(response);state.selectedReviewTimestamps.clear();renderReviewHistory();updateReviewControls();updateWorkflowLinks({sources:SOURCES,review_file:CONFIG.review_file,default_domain:CONFIG.default_domain,dataset_viewer_url:CONFIG.dataset_viewer_url,workspace_root:CONFIG.workspace_root});draw();setStatus(`已将 ${response.updated_count} 条历史记录调整为${split==='val'?'验证集':'训练集'}`)}
 function setLeftTab(tab){if(!['map','review','generation'].includes(tab))return;state.leftTab=tab;document.querySelectorAll('.left-tab').forEach(button=>{const selected=button.dataset.tab===tab;button.setAttribute('aria-selected',selected?'true':'false')});document.querySelectorAll('.left-tab-panel').forEach(panel=>{panel.hidden=panel.dataset.panel!==tab})}
 function updateRightButton(){const collapsed=$('app').classList.contains('audit-collapsed');$('toggleRight').textContent=collapsed?'打开审核面板':'收起审核面板';$('toggleRight').setAttribute('aria-expanded',collapsed?'false':'true')}
@@ -1376,7 +1416,7 @@ $('random').addEventListener('click',()=>randomCandidate().catch(x=>setStatus('�
 $('runFit').addEventListener('click',()=>runFit().catch(x=>setStatus('拟合失败：'+x.message)));
 document.querySelectorAll('.left-tab').forEach(button=>button.addEventListener('click',()=>setLeftTab(button.dataset.tab)));
 $('toggleRight').addEventListener('click',()=>{$('app').classList.toggle('audit-collapsed');updateRightButton()});
- $('approve').addEventListener('click',()=>review('approve').catch(x=>setStatus('保存失败：'+x.message)));$('reject').addEventListener('click',()=>review('reject').catch(x=>setStatus('保存失败：'+x.message)));$('approveNext').addEventListener('click',()=>review('approve',true).catch(x=>setStatus('保存失败：'+x.message)));$('rejectNext').addEventListener('click',()=>review('reject',true).catch(x=>setStatus('保存失败：'+x.message)));$('updateReviewSplit').addEventListener('click',()=>updateReviewSplit().catch(x=>setStatus('更新归属失败：'+x.message)));
+ $('approve').addEventListener('click',()=>review('approve').catch(x=>setStatus('保存失败：'+x.message)));$('reject').addEventListener('click',()=>review('reject').catch(x=>setStatus('保存失败：'+x.message)));$('approveNext').addEventListener('click',()=>review('approve',true).catch(x=>setStatus('保存失败：'+x.message)));$('rejectNext').addEventListener('click',()=>review('reject',true).catch(x=>setStatus('保存失败：'+x.message)));$('updateReviewSplit').addEventListener('click',()=>updateReviewSplit().catch(x=>setStatus('更新归属失败：'+x.message)));$('deleteReview').addEventListener('click',()=>deleteReview().catch(x=>setStatus('删除失败：'+x.message)));
 $('showAllReviews').addEventListener('change',()=>{renderReviewHistory();draw()});
  $('selectAllReviews').addEventListener('change',e=>{for(const {record} of visibleSelectableReviews()){if(e.target.checked)state.selectedReviewTimestamps.add(record.timestamp_utc);else state.selectedReviewTimestamps.delete(record.timestamp_utc)};syncBulkReviewControls();renderReviewHistory()});$('reviewHistory').addEventListener('change',e=>{const checkbox=e.target.closest('.history-select');if(!checkbox||!state.source)return;const record=state.source.review_records[Number(checkbox.dataset.reviewIndex)];if(!record||!reviewIsSelectable(record))return;if(checkbox.checked)state.selectedReviewTimestamps.add(record.timestamp_utc);else state.selectedReviewTimestamps.delete(record.timestamp_utc);syncBulkReviewControls()});$('reviewHistory').addEventListener('click',e=>{if(e.target.closest('.history-select'))return;const button=e.target.closest('.history-open');if(!button||!state.source)return;loadReview(state.source.review_records[Number(button.dataset.reviewIndex)])});$('bulkUpdateReview').addEventListener('click',()=>updateSelectedReviewSplits().catch(x=>setStatus('批量更新归属失败：'+x.message)));
  $('confirmDomain').addEventListener('click',()=>confirmDomain().catch(x=>setStatus('切换审核记录失败：'+x.message)));$('startDatasetViewer').addEventListener('click',()=>startDatasetViewer().catch(x=>setStatus('启动结果查看器失败：'+x.message)));$('openDatasetViewer').addEventListener('click',openDatasetViewer);$('stopDatasetViewer').addEventListener('click',()=>stopDatasetViewer().catch(x=>setStatus('关闭结果查看器失败：'+x.message)));
@@ -1615,7 +1655,8 @@ def make_handler(catalog, html, workspace, default_domain,
                                "/api/export-canonical", "/api/generate-dataset",
                                "/api/stop-job", "/api/start-viewer", "/api/stop-viewer",
                                "/api/review", "/api/update-review",
-                               "/api/update-review-batch", "/api/fit"}:
+                               "/api/update-review-batch",
+                               "/api/delete-review", "/api/fit"}:
                 pass
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -1662,6 +1703,17 @@ def make_handler(catalog, html, workspace, default_domain,
                 source_id = record.get("source_id", "")
                 if source_id not in catalog.sources:
                     raise ValueError(f"Unknown source: {source_id}")
+                if parsed.path == "/api/delete-review":
+                    timestamp_utc = record.get("timestamp_utc")
+                    if not isinstance(timestamp_utc, str) or not timestamp_utc:
+                        raise ValueError("timestamp_utc is required")
+                    result = catalog.review_store.delete_record(
+                        source_id, timestamp_utc)
+                    catalog_summary = catalog.index()
+                    result["open_slots"] = catalog_summary["open_slots"]
+                    result["sources"] = catalog_summary["sources"]
+                    self.send_json(result)
+                    return
                 if parsed.path == "/api/update-review":
                     timestamp_utc = record.get("timestamp_utc")
                     if not isinstance(timestamp_utc, str) or not timestamp_utc:
